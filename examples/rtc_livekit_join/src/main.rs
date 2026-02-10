@@ -1573,7 +1573,9 @@ where
                         &context.local_key,
                     )
                     .await
-                    .map_err(LiveKitError::connector)?;
+                    .map_err(|err| {
+                        LiveKitError::connector(std::io::Error::other(err.to_string()))
+                    })?;
                 } else {
                     info!(%identity, "unable to extract participant device id for to-device E2EE key send");
                 }
