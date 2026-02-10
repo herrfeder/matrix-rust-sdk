@@ -1457,6 +1457,8 @@ async fn send_per_participant_keys(
 
     let content_raw = Raw::new(&serde_json::json!({
         "keys": { "index": key_index, "key": key_b64 },
+        // Legacy/compat field that some receivers still read directly.
+        "device_id": claimed,
         "member": { "claimed_device_id": claimed, "id": member_id },
         "room_id": room.room_id().to_string(),
         "session": {
@@ -1521,7 +1523,17 @@ fn register_e2ee_to_device_handler(
             if content_room_id != room_id.as_str() {
                 return;
             }
-            let Some(device_id) = content.get("device_id").and_then(|v| v.as_str()) else {
+            let device_id = content
+                .get("device_id")
+                .and_then(|v| v.as_str())
+                .or_else(|| {
+                    content
+                        .get("member")
+                        .and_then(|v| v.as_object())
+                        .and_then(|member| member.get("claimed_device_id"))
+                        .and_then(|v| v.as_str())
+                });
+            let Some(device_id) = device_id else {
                 return;
             };
             let keys = content.get("keys");
