@@ -2,17 +2,24 @@
 
 use std::{env, fs};
 
-use anyhow::{Context, anyhow};
-use matrix_sdk::{
-    Client,
-    event_handler::EventHandlerDropGuard,
-    RoomState,
-    RoomMemberships,
-    config::SyncSettings,
-    ruma::{OwnedRoomId, OwnedServerName, RoomId, RoomOrAliasId, ServerName},
+use anyhow::{anyhow, Context};
+#[cfg(feature = "e2ee-per-participant")]
+use base64::{
+    engine::general_purpose::{STANDARD, STANDARD_NO_PAD},
+    Engine as _,
 };
 #[cfg(feature = "e2e-encryption")]
+use futures_util::StreamExt;
+#[cfg(feature = "e2e-encryption")]
 use matrix_sdk::encryption::secret_storage::SecretStore;
+#[cfg(feature = "e2ee-per-participant")]
+use matrix_sdk::ruma::CanonicalJsonValue;
+use matrix_sdk::{
+    config::SyncSettings,
+    event_handler::EventHandlerDropGuard,
+    ruma::{OwnedRoomId, OwnedServerName, RoomId, RoomOrAliasId, ServerName},
+    Client, RoomMemberships, RoomState,
+};
 #[cfg(feature = "experimental-widgets")]
 use matrix_sdk::{
     ruma::{DeviceId, UserId},
@@ -23,40 +30,34 @@ use matrix_sdk::{
         WidgetSettings,
     },
 };
+#[cfg(feature = "e2ee-per-participant")]
+use matrix_sdk_base::crypto::CollectStrategy;
+#[cfg(feature = "e2ee-per-participant")]
+use matrix_sdk_crypto::types::room_history::RoomKeyBundle;
+#[cfg(any(all(feature = "v4l2", target_os = "linux"), feature = "e2ee-per-participant"))]
+use matrix_sdk_rtc::LiveKitError;
+use matrix_sdk_rtc::{livekit_service_url, LiveKitConnector, LiveKitResult};
+#[cfg(feature = "e2ee-per-participant")]
+use matrix_sdk_rtc_livekit::livekit::e2ee::{
+    key_provider::{KeyProvider, KeyProviderOptions},
+    E2eeOptions, EncryptionType,
+};
+#[cfg(feature = "e2ee-per-participant")]
+use matrix_sdk_rtc_livekit::livekit::id::ParticipantIdentity;
+use matrix_sdk_rtc_livekit::{
+    LiveKitRoomOptionsProvider, LiveKitSdkConnector, LiveKitTokenProvider, Room, RoomOptions,
+};
+use ruma::api::client::account::request_openid_token;
 #[cfg(feature = "experimental-widgets")]
 use ruma::events::call::member::{
     ActiveFocus, ActiveLivekitFocus, Application, CallApplicationContent, CallMemberEventContent,
     CallMemberStateKey, CallScope, Focus, LivekitFocus,
 };
-use matrix_sdk_rtc::{LiveKitConnector, LiveKitResult, livekit_service_url};
-#[cfg(all(feature = "v4l2", target_os = "linux"))]
-use matrix_sdk_rtc::LiveKitError;
-use matrix_sdk_rtc_livekit::{
-    LiveKitRoomOptionsProvider, LiveKitSdkConnector, LiveKitTokenProvider, RoomOptions, Room,
-};
-#[cfg(feature = "e2e-encryption")]
-use futures_util::StreamExt;
-#[cfg(feature = "e2ee-per-participant")]
-use matrix_sdk_rtc_livekit::livekit::e2ee::{
-    E2eeOptions, EncryptionType,
-    key_provider::{KeyProvider, KeyProviderOptions},
-};
-#[cfg(feature = "e2ee-per-participant")]
-use matrix_sdk_rtc_livekit::livekit::id::ParticipantIdentity;
-#[cfg(feature = "e2ee-per-participant")]
-use matrix_sdk::ruma::CanonicalJsonValue;
-#[cfg(feature = "e2ee-per-participant")]
-use matrix_sdk_crypto::types::room_history::RoomKeyBundle;
-use ruma::api::client::account::request_openid_token;
-#[cfg(feature = "e2ee-per-participant")]
-use ruma::serde::Raw;
 #[cfg(feature = "e2ee-per-participant")]
 use ruma::events::AnyToDeviceEvent;
+#[cfg(feature = "e2ee-per-participant")]
+use ruma::serde::Raw;
 use serde_json::Value as JsonValue;
-#[cfg(feature = "e2ee-per-participant")]
-use base64::{Engine as _, engine::general_purpose::{STANDARD, STANDARD_NO_PAD}};
-#[cfg(feature = "e2ee-per-participant")]
-use matrix_sdk_base::crypto::CollectStrategy;
 #[cfg(feature = "experimental-widgets")]
 use tokio::io::{AsyncBufReadExt, BufReader};
 #[cfg(feature = "experimental-widgets")]
@@ -284,8 +285,8 @@ fn run_v4l2_capture_loop(
     use matrix_sdk_rtc_livekit::livekit::webrtc::native::yuv_helper;
     use matrix_sdk_rtc_livekit::livekit::webrtc::prelude::{I420Buffer, VideoFrame, VideoRotation};
     use v4l::buffer::Type;
-    use v4l::io::traits::CaptureStream;
     use v4l::io::mmap::Stream;
+    use v4l::io::traits::CaptureStream;
     use v4l::video::Capture;
 
     let format = device.format().context("re-read V4L2 format")?;
@@ -343,15 +344,7 @@ fn run_v4l2_capture_loop(
             }
             V4l2PixelFormat::Yuyv => {
                 yuyv_to_i420(
-                    data,
-                    stride,
-                    height,
-                    dst_y,
-                    stride_y,
-                    dst_u,
-                    stride_u,
-                    dst_v,
-                    stride_v,
+                    data, stride, height, dst_y, stride_y, dst_u, stride_u, dst_v, stride_v,
                 );
             }
         }
@@ -364,7 +357,10 @@ fn run_v4l2_capture_loop(
 }
 
 #[cfg(all(feature = "v4l2", target_os = "linux"))]
-fn set_format_with_fallback(device: &mut v4l::Device, mut format: v4l::format::Format) -> anyhow::Result<v4l::format::Format> {
+fn set_format_with_fallback(
+    device: &mut v4l::Device,
+    mut format: v4l::format::Format,
+) -> anyhow::Result<v4l::format::Format> {
     use v4l::video::Capture;
     use v4l::FourCC;
 
@@ -473,9 +469,8 @@ async fn main() -> anyhow::Result<()> {
     let livekit_sfu_get_url = optional_env("LIVEKIT_SFU_GET_URL");
     let v4l2_config = v4l2_config_from_env().context("read V4L2 config")?;
 
-    let store_dir = std::env::current_dir()
-        .context("read current directory")?
-        .join("matrix-sdk-store");
+    let store_dir =
+        std::env::current_dir().context("read current directory")?.join("matrix-sdk-store");
     if store_dir.is_file() {
         warn!(
             store_path = %store_dir.display(),
@@ -540,9 +535,7 @@ async fn main() -> anyhow::Result<()> {
         login_builder = login_builder.device_id(device_id);
     }
     login_builder.send().await.context("login Matrix user")?;
-    import_recovery_key_if_set(&client)
-        .await
-        .context("import recovery key")?;
+    import_recovery_key_if_set(&client).await.context("import recovery key")?;
     log_backup_state(&client).await;
 
     let room_id_or_alias = RoomOrAliasId::parse(room_id_or_alias).context("parse ROOM_ID")?;
@@ -550,10 +543,7 @@ async fn main() -> anyhow::Result<()> {
     let room = match RoomId::parse(room_id_or_alias.as_str()) {
         Ok(room_id) => match client.get_room(&room_id) {
             Some(room) if room.state() == RoomState::Joined => room,
-            _ => client
-                .join_room_by_id(&room_id)
-                .await
-                .context("join room")?,
+            _ => client.join_room_by_id(&room_id).await.context("join room")?,
         },
         Err(_) => client
             .join_room_by_id_or_alias(&room_id_or_alias, &via_servers)
@@ -561,8 +551,8 @@ async fn main() -> anyhow::Result<()> {
             .context("join room")?,
     };
     spawn_backup_diagnostics(client.clone(), room.room_id().to_owned());
-    let element_call_url = optional_env("ELEMENT_CALL_URL")
-        .or_else(|| optional_env("ELEMENT_CALL_WIDGET"));
+    let element_call_url =
+        optional_env("ELEMENT_CALL_URL").or_else(|| optional_env("ELEMENT_CALL_WIDGET"));
     let widget = if let Some(element_call_url) = element_call_url {
         info!(%element_call_url, "Element Call widget URL set; starting widget bridge");
         start_element_call_widget(room.clone(), element_call_url)
@@ -575,14 +565,11 @@ async fn main() -> anyhow::Result<()> {
         None
     };
 
-
     #[cfg(not(feature = "experimental-widgets"))]
     let _ = &widget;
 
     let sync_client = client.clone();
-    let sync_handle = tokio::spawn(async move {
-        sync_client.sync(SyncSettings::new()).await
-    });
+    let sync_handle = tokio::spawn(async move { sync_client.sync(SyncSettings::new()).await });
 
     // NOTE: Joining a call requires publishing MatrixRTC memberships (m.call.member) for
     // this device. When the optional Element Call widget wiring is enabled, this example
@@ -600,13 +587,9 @@ async fn main() -> anyhow::Result<()> {
     //   webview's postMessage channel.
 
     let (service_url, livekit_token) = if let Some(sfu_url) = livekit_sfu_get_url {
-        let openid_token = request_openid_token(&client)
-            .await
-            .context("request OpenID token")?;
-        let device_id = client
-            .device_id()
-            .context("missing device id for /sfu/get request")?
-            .to_string();
+        let openid_token = request_openid_token(&client).await.context("request OpenID token")?;
+        let device_id =
+            client.device_id().context("missing device id for /sfu/get request")?.to_string();
         fetch_sfu_token(&sfu_url, room.room_id().to_owned(), device_id, &openid_token)
             .await
             .context("fetch LiveKit token from /sfu/get")?
@@ -614,9 +597,7 @@ async fn main() -> anyhow::Result<()> {
         let token = required_env("LIVEKIT_TOKEN")?;
         let service_url = match livekit_service_url_override {
             Some(url) => url,
-            None => livekit_service_url(&client)
-                .await
-                .context("fetch LiveKit service url")?,
+            None => livekit_service_url(&client).await.context("fetch LiveKit service url")?,
         };
         (service_url, token)
     };
@@ -636,9 +617,13 @@ async fn main() -> anyhow::Result<()> {
         spawn_periodic_e2ee_key_resend(room.clone(), context.clone());
     }
     #[cfg(feature = "e2ee-per-participant")]
-    let _e2ee_to_device_guard = e2ee_context
-        .as_ref()
-        .map(|context| register_e2ee_to_device_handler(&client, room.room_id().to_owned(), context.key_provider.clone()));
+    let _e2ee_to_device_guard = e2ee_context.as_ref().map(|context| {
+        register_e2ee_to_device_handler(
+            &client,
+            room.room_id().to_owned(),
+            context.key_provider.clone(),
+        )
+    });
     #[cfg(feature = "e2ee-per-participant")]
     let room_options_provider = E2eeRoomOptionsProvider { e2ee: e2ee_context.clone() };
     #[cfg(not(feature = "e2ee-per-participant"))]
@@ -661,8 +646,8 @@ async fn main() -> anyhow::Result<()> {
         #[cfg(feature = "e2ee-per-participant")]
         e2ee_context,
     )
-        .await
-        .context("run LiveKit room driver")?;
+    .await
+    .context("run LiveKit room driver")?;
 
     sync_handle.abort();
 
@@ -684,15 +669,11 @@ fn bool_env(name: &str) -> bool {
 }
 
 fn retry_attempts_from_env(name: &str, default: usize) -> usize {
-    optional_env(name)
-        .and_then(|value| value.parse::<usize>().ok())
-        .unwrap_or(default)
+    optional_env(name).and_then(|value| value.parse::<usize>().ok()).unwrap_or(default)
 }
 
 fn retry_seconds_from_env(name: &str, default: u64) -> u64 {
-    optional_env(name)
-        .and_then(|value| value.parse::<u64>().ok())
-        .unwrap_or(default)
+    optional_env(name).and_then(|value| value.parse::<u64>().ok()).unwrap_or(default)
 }
 
 #[cfg(feature = "e2e-encryption")]
@@ -712,10 +693,7 @@ async fn import_recovery_key_if_set(client: &Client) -> anyhow::Result<()> {
         .open_secret_store(&recovery_key)
         .await
         .context("open secret storage with recovery key")?;
-    secret_store
-        .import_secrets()
-        .await
-        .context("import secrets from secret storage")?;
+    secret_store.import_secrets().await.context("import secrets from secret storage")?;
     info!("recovery key import finished");
     Ok(())
 }
@@ -726,12 +704,7 @@ async fn log_backup_state(client: &Client) {
     let state = backups.state();
     let enabled = backups.are_enabled().await;
     let exists = backups.fetch_exists_on_server().await.unwrap_or(false);
-    info!(
-        ?state,
-        enabled,
-        exists_on_server = exists,
-        "backup state summary"
-    );
+    info!(?state, enabled, exists_on_server = exists, "backup state summary");
     if exists && !enabled {
         info!(
             "backup exists on the server but backups are not enabled; ensure the recovery key is available"
@@ -757,10 +730,7 @@ fn spawn_backup_diagnostics(client: Client, room_id: OwnedRoomId) {
     });
 
     tokio::spawn(async move {
-        let key_stream = client
-            .encryption()
-            .backups()
-            .room_keys_for_room_stream(&room_id);
+        let key_stream = client.encryption().backups().room_keys_for_room_stream(&room_id);
         futures_util::pin_mut!(key_stream);
         while let Some(update) = key_stream.next().await {
             match update {
@@ -776,30 +746,14 @@ fn spawn_backup_diagnostics(client: Client, room_id: OwnedRoomId) {
 fn spawn_backup_diagnostics(_client: Client, _room_id: OwnedRoomId) {}
 
 #[cfg(feature = "e2ee-per-participant")]
-fn spawn_periodic_e2ee_key_resend(
-    room: matrix_sdk::Room,
-    context: PerParticipantE2eeContext,
-) {
+fn spawn_periodic_e2ee_key_resend(_room: matrix_sdk::Room, _context: PerParticipantE2eeContext) {
     let interval_secs = retry_seconds_from_env("PER_PARTICIPANT_KEY_RESEND_SECS", 0);
-    if interval_secs == 0 {
-        return;
+    if interval_secs > 0 {
+        info!(
+            interval_secs,
+            "PER_PARTICIPANT_KEY_RESEND_SECS is set, but periodic resend is disabled until a LiveKit participant id-aware resend path is implemented"
+        );
     }
-    tokio::spawn(async move {
-        let mut interval = tokio::time::interval(std::time::Duration::from_secs(interval_secs));
-        loop {
-            interval.tick().await;
-            info!(
-                interval_secs,
-                key_index = context.key_index,
-                "periodic per-participant E2EE key resend"
-            );
-            if let Err(err) =
-                send_per_participant_keys(&room, context.key_index, &context.local_key).await
-            {
-                info!(?err, "failed to resend per-participant E2EE keys");
-            }
-        }
-    });
 }
 
 #[cfg(not(feature = "e2ee-per-participant"))]
@@ -813,9 +767,7 @@ fn element_call_capabilities(own_user_id: &UserId, own_device_id: &DeviceId) -> 
         Filter::MessageLike(MessageLikeEventFilter::WithType(MessageLikeEventType::from(
             "org.matrix.rageshake_request",
         ))),
-        Filter::ToDevice(ToDeviceEventFilter::new(
-            "io.element.call.encryption_keys".into(),
-        )),
+        Filter::ToDevice(ToDeviceEventFilter::new("io.element.call.encryption_keys".into())),
         Filter::MessageLike(MessageLikeEventFilter::WithType(MessageLikeEventType::from(
             "io.element.call.encryption_keys",
         ))),
@@ -823,12 +775,8 @@ fn element_call_capabilities(own_user_id: &UserId, own_device_id: &DeviceId) -> 
             "io.element.call.reaction",
         ))),
         Filter::MessageLike(MessageLikeEventFilter::WithType(MessageLikeEventType::Reaction)),
-        Filter::MessageLike(MessageLikeEventFilter::WithType(
-            MessageLikeEventType::RoomRedaction,
-        )),
-        Filter::MessageLike(MessageLikeEventFilter::WithType(
-            MessageLikeEventType::RtcDecline,
-        )),
+        Filter::MessageLike(MessageLikeEventFilter::WithType(MessageLikeEventType::RoomRedaction)),
+        Filter::MessageLike(MessageLikeEventFilter::WithType(MessageLikeEventType::RtcDecline)),
     ];
 
     let user_id = own_user_id.as_str();
@@ -856,9 +804,7 @@ fn element_call_capabilities(own_user_id: &UserId, own_device_id: &DeviceId) -> 
             Filter::MessageLike(MessageLikeEventFilter::WithType(
                 MessageLikeEventType::RtcNotification,
             )),
-            Filter::MessageLike(MessageLikeEventFilter::WithType(
-                MessageLikeEventType::CallNotify,
-            )),
+            Filter::MessageLike(MessageLikeEventFilter::WithType(MessageLikeEventType::CallNotify)),
             Filter::State(StateEventFilter::WithTypeAndStateKey(
                 StateEventType::CallMember,
                 user_id.to_owned(),
@@ -898,16 +844,10 @@ async fn start_element_call_widget(
     room: matrix_sdk::Room,
     element_call_url: String,
 ) -> anyhow::Result<Option<ElementCallWidget>> {
-    let own_user_id = room
-        .client()
-        .user_id()
-        .context("missing user id for element call widget")?
-        .to_owned();
-    let own_device_id = room
-        .client()
-        .device_id()
-        .context("missing device id for element call widget")?
-        .to_owned();
+    let own_user_id =
+        room.client().user_id().context("missing user id for element call widget")?.to_owned();
+    let own_device_id =
+        room.client().device_id().context("missing device id for element call widget")?.to_owned();
 
     let encryption_state = room
         .latest_encryption_state()
@@ -929,8 +869,8 @@ async fn start_element_call_widget(
         EncryptionSystem::Unencrypted
     };
 
-    let widget_id = optional_env("ELEMENT_CALL_WIDGET_ID")
-        .unwrap_or_else(|| "element-call".to_owned());
+    let widget_id =
+        optional_env("ELEMENT_CALL_WIDGET_ID").unwrap_or_else(|| "element-call".to_owned());
     let props = VirtualElementCallWidgetProperties {
         element_call_url,
         widget_id,
@@ -938,10 +878,8 @@ async fn start_element_call_widget(
         encryption,
         ..Default::default()
     };
-    let config = VirtualElementCallWidgetConfig {
-        intent: Some(Intent::JoinExisting),
-        ..Default::default()
-    };
+    let config =
+        VirtualElementCallWidgetConfig { intent: Some(Intent::JoinExisting), ..Default::default() };
 
     let widget_settings = WidgetSettings::new_virtual_element_call_widget(props, config)
         .context("build element call widget settings")?;
@@ -1074,11 +1012,7 @@ async fn start_element_call_widget(
     });
     let _ = handle.send(content_loaded.to_string()).await;
 
-    Ok(Some(ElementCallWidget {
-        handle,
-        widget_id,
-        capabilities_ready: capabilities_ready_rx,
-    }))
+    Ok(Some(ElementCallWidget { handle, widget_id, capabilities_ready: capabilities_ready_rx }))
 }
 
 #[cfg(not(feature = "experimental-widgets"))]
@@ -1113,13 +1047,12 @@ async fn publish_call_membership_via_widget(
     let state_key =
         CallMemberStateKey::new(own_user_id.clone(), Some(own_device_id.to_string()), false);
     let call_id = room.room_id().to_string();
-    let application = Application::Call(CallApplicationContent::new(call_id.clone(), CallScope::Room));
+    let application =
+        Application::Call(CallApplicationContent::new(call_id.clone(), CallScope::Room));
     let focus_active = ActiveFocus::Livekit(ActiveLivekitFocus::new());
     let focus_alias = format!("livekit-{}", room.room_id());
-    let foci_preferred = vec![Focus::Livekit(LivekitFocus::new(
-        focus_alias,
-        service_url.to_owned(),
-    ))];
+    let foci_preferred =
+        vec![Focus::Livekit(LivekitFocus::new(focus_alias, service_url.to_owned()))];
     let content = CallMemberEventContent::new(
         application,
         own_device_id,
@@ -1128,14 +1061,12 @@ async fn publish_call_membership_via_widget(
         None,
         None,
     );
-    info!("we also arrive here");
     let send_response = room
         .send_state_event_for_key(&state_key, content)
         .await
         .context("send MatrixRTC membership state event")?;
     info!(state_key = state_key.as_ref(), "published MatrixRTC membership state event");
     info!(event_id = %send_response.event_id, "published MatrixRTC membership state event");
-    info!("we also arrive here");
     Ok(())
 }
 
@@ -1157,9 +1088,7 @@ fn via_servers_from_env() -> anyhow::Result<Vec<OwnedServerName>> {
 async fn request_openid_token(
     client: &Client,
 ) -> anyhow::Result<request_openid_token::v3::Response> {
-    let user_id = client
-        .user_id()
-        .context("missing user id for OpenID token request")?;
+    let user_id = client.user_id().context("missing user id for OpenID token request")?;
     let request = request_openid_token::v3::Request::new(user_id.to_owned());
     let response = client.send(request).await?;
     Ok(response)
@@ -1204,14 +1133,7 @@ async fn fetch_sfu_token(
 
     let service_url = extract_string(
         &payload,
-        &[
-            "service_url",
-            "livekit_service_url",
-            "livekit_url",
-            "sfu_base_url",
-            "sfu_url",
-            "url",
-        ],
+        &["service_url", "livekit_service_url", "livekit_url", "sfu_base_url", "sfu_url", "url"],
     )
     .context("missing LiveKit service url in /sfu/get response")?;
     let token = extract_string(&payload, &["token", "jwt", "access_token"])
@@ -1222,18 +1144,13 @@ async fn fetch_sfu_token(
 
 fn extract_string(payload: &JsonValue, keys: &[&str]) -> Option<String> {
     keys.iter().find_map(|key| {
-        payload
-            .get(*key)
-            .and_then(|value| value.as_str())
-            .map(|value| value.to_owned())
+        payload.get(*key).and_then(|value| value.as_str()).map(|value| value.to_owned())
     })
 }
 
 fn ensure_access_token_query(service_url: &str, token: &str) -> anyhow::Result<String> {
     let mut url = Url::parse(service_url)?;
-    let has_access_token = url
-        .query_pairs()
-        .any(|(key, _)| key == "access_token");
+    let has_access_token = url.query_pairs().any(|(key, _)| key == "access_token");
     if !has_access_token {
         url.query_pairs_mut().append_pair("access_token", token);
     }
@@ -1245,13 +1162,11 @@ async fn build_per_participant_e2ee(
     room: &matrix_sdk::Room,
 ) -> anyhow::Result<Option<PerParticipantE2eeContext>> {
     use matrix_sdk_rtc_livekit::matrix_keys::{
-        OlmMachineKeyMaterialProvider, PerParticipantKeyMaterialProvider, room_olm_machine,
+        room_olm_machine, OlmMachineKeyMaterialProvider, PerParticipantKeyMaterialProvider,
     };
 
-    let encryption_state = room
-        .latest_encryption_state()
-        .await
-        .context("load room encryption state")?;
+    let encryption_state =
+        room.latest_encryption_state().await.context("load room encryption state")?;
     if !encryption_state.is_encrypted() {
         info!("room is not encrypted; per-participant E2EE disabled");
         return Ok(None);
@@ -1286,10 +1201,7 @@ async fn build_per_participant_e2ee(
             break bundle;
         }
         if attempt >= retries {
-            info!(
-                retries,
-                "per-participant key bundle is empty; E2EE disabled"
-            );
+            info!(retries, "per-participant key bundle is empty; E2EE disabled");
             return Ok(None);
         }
         attempt += 1;
@@ -1300,11 +1212,7 @@ async fn build_per_participant_e2ee(
                 Err(err) => info!(?err, "failed to request room keys from backup"),
             }
         }
-        info!(
-            attempt,
-            retries,
-            "per-participant key bundle empty; retrying after delay"
-        );
+        info!(attempt, retries, "per-participant key bundle empty; retrying after delay");
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
     };
     info!(
@@ -1315,13 +1223,8 @@ async fn build_per_participant_e2ee(
     info!("per-participant key bundle available; enabling E2EE");
     let key_provider = KeyProvider::new(KeyProviderOptions::default());
     let local_key = derive_per_participant_key(&bundle)?;
-    send_per_participant_keys(room, 0, &local_key).await?;
 
-    Ok(Some(PerParticipantE2eeContext {
-        key_provider,
-        key_index: 0,
-        local_key,
-    }))
+    Ok(Some(PerParticipantE2eeContext { key_provider, key_index: 0, local_key }))
 }
 
 #[cfg(feature = "e2ee-per-participant")]
@@ -1369,26 +1272,21 @@ fn canonicalize_bundle_entries<T: serde::Serialize>(
 
     for entry in entries {
         let value = serde_json::to_value(entry).context("serialize bundle entry")?;
-        let canonical: CanonicalJsonValue = value
-            .clone()
-            .try_into()
-            .context("canonicalize bundle entry")?;
+        let canonical: CanonicalJsonValue =
+            value.clone().try_into().context("canonicalize bundle entry")?;
         let sort_key = serde_json::to_string(&canonical).context("serialize bundle entry")?;
         canonical_entries.push((sort_key, value));
     }
 
     canonical_entries.sort_by(|left, right| left.0.cmp(&right.0));
 
-    Ok(canonical_entries
-        .into_iter()
-        .map(|(_, value)| value)
-        .collect())
+    Ok(canonical_entries.into_iter().map(|(_, value)| value).collect())
 }
-
 
 #[cfg(feature = "e2ee-per-participant")]
 async fn send_per_participant_keys(
     room: &matrix_sdk::Room,
+    sender_device_id: &str,
     key_index: i32,
     key: &[u8],
 ) -> anyhow::Result<()> {
@@ -1405,10 +1303,7 @@ async fn send_per_participant_keys(
     let key = if key.len() >= 16 { &key[..16] } else { key };
 
     let client = room.client();
-    let own_device_id = client
-        .device_id()
-        .context("missing device id for per-participant E2EE")?
-        .to_owned();
+    let own_device_id = client.device_id().map(|id| id.to_owned());
     let own_user_id = client.user_id().map(|id| id.to_owned());
 
     let members = room.members(RoomMemberships::JOIN).await?;
@@ -1423,8 +1318,10 @@ async fn send_per_participant_keys(
 
         for device in device_list {
             if let Some(own_user_id) = own_user_id.as_ref() {
-                if device.user_id() == own_user_id && device.device_id() == &own_device_id {
-                    continue;
+                if let Some(own_device_id) = own_device_id.as_ref() {
+                    if device.user_id() == own_user_id && device.device_id() == own_device_id {
+                        continue;
+                    }
                 }
             }
             recipients.push(device);
@@ -1450,14 +1347,12 @@ async fn send_per_participant_keys(
         "sending per-participant E2EE keys to devices"
     );
 
-
     let own_user_id = client.user_id().context("missing user id")?;
-    let claimed = own_device_id.as_str();
+    let claimed = sender_device_id;
     let member_id = format!("{own_user_id}:{claimed}");
 
     let content_raw = Raw::new(&serde_json::json!({
         "keys": { "index": key_index, "key": key_b64 },
-        // Legacy/compat field that some receivers still read directly.
         "device_id": claimed,
         "member": { "claimed_device_id": claimed, "id": member_id },
         "room_id": room.room_id().to_string(),
@@ -1489,7 +1384,6 @@ async fn send_per_participant_keys(
 
     Ok(())
 }
-
 
 #[cfg(feature = "e2ee-per-participant")]
 fn register_e2ee_to_device_handler(
@@ -1523,17 +1417,7 @@ fn register_e2ee_to_device_handler(
             if content_room_id != room_id.as_str() {
                 return;
             }
-            let device_id = content
-                .get("device_id")
-                .and_then(|v| v.as_str())
-                .or_else(|| {
-                    content
-                        .get("member")
-                        .and_then(|v| v.as_object())
-                        .and_then(|member| member.get("claimed_device_id"))
-                        .and_then(|v| v.as_str())
-                });
-            let Some(device_id) = device_id else {
+            let Some(device_id) = content.get("device_id").and_then(|v| v.as_str()) else {
                 return;
             };
             let keys = content.get("keys");
@@ -1555,9 +1439,8 @@ fn register_e2ee_to_device_handler(
                 let Some(key_b64) = key_entry.get("key").and_then(|v| v.as_str()) else {
                     continue;
                 };
-                let key_bytes = STANDARD_NO_PAD
-                    .decode(key_b64)
-                    .or_else(|_| STANDARD.decode(key_b64));
+                let key_bytes =
+                    STANDARD_NO_PAD.decode(key_b64).or_else(|_| STANDARD.decode(key_b64));
                 let Ok(key_bytes) = key_bytes else {
                     continue;
                 };
@@ -1623,14 +1506,16 @@ where
     if connection.take().is_some() {
         #[cfg(all(feature = "v4l2", target_os = "linux"))]
         if let Some(publisher) = v4l2_publisher.take() {
-            publisher
-                .stop()
-                .await
-                .map_err(|err| LiveKitError::connector(V4l2PublishError(err)))?;
+            publisher.stop().await.map_err(|err| LiveKitError::connector(V4l2PublishError(err)))?;
         }
     }
 
     Ok(())
+}
+
+#[cfg(feature = "e2ee-per-participant")]
+fn participant_device_id(identity: &str) -> Option<&str> {
+    identity.rsplit_once(':').map(|(_, device_id)| device_id)
 }
 
 async fn update_connection<O>(
@@ -1668,9 +1553,11 @@ where
             #[cfg(feature = "e2ee-per-participant")]
             if let Some(context) = e2ee_context.as_ref() {
                 let identity = room_handle.local_participant().identity();
-                let key_set = context
-                    .key_provider
-                    .set_key(&identity, context.key_index, context.local_key.clone());
+                let key_set = context.key_provider.set_key(
+                    &identity,
+                    context.key_index,
+                    context.local_key.clone(),
+                );
                 room_handle.e2ee_manager().set_enabled(true);
                 info!(
                     %identity,
@@ -1678,17 +1565,27 @@ where
                     key_set,
                     "enabled per-participant E2EE for local participant"
                 );
+                if let Some(sender_device_id) = participant_device_id(identity.as_str()) {
+                    send_per_participant_keys(
+                        room,
+                        sender_device_id,
+                        context.key_index,
+                        &context.local_key,
+                    )
+                    .await
+                    .map_err(LiveKitError::connector)?;
+                } else {
+                    info!(%identity, "unable to extract participant device id for to-device E2EE key send");
+                }
             }
             #[cfg(all(feature = "v4l2", target_os = "linux"))]
             if v4l2_publisher.is_none() {
                 if let Some(config) = v4l2_config.as_option().cloned() {
                     info!(device = %config.device, "starting V4L2 camera publisher");
-                    let publisher = V4l2CameraPublisher::start(
-                        std::sync::Arc::clone(&room_handle),
-                        config,
-                    )
-                    .await
-                    .map_err(|err| LiveKitError::connector(V4l2PublishError(err)))?;
+                    let publisher =
+                        V4l2CameraPublisher::start(std::sync::Arc::clone(&room_handle), config)
+                            .await
+                            .map_err(|err| LiveKitError::connector(V4l2PublishError(err)))?;
                     *v4l2_publisher = Some(publisher);
                 }
             }
@@ -1698,10 +1595,7 @@ where
         info!(room_id = ?room.room_id(), "leaving LiveKit room because the call ended");
         #[cfg(all(feature = "v4l2", target_os = "linux"))]
         if let Some(publisher) = v4l2_publisher.take() {
-            publisher
-                .stop()
-                .await
-                .map_err(|err| LiveKitError::connector(V4l2PublishError(err)))?;
+            publisher.stop().await.map_err(|err| LiveKitError::connector(V4l2PublishError(err)))?;
         }
     }
 
