@@ -1226,8 +1226,13 @@ async fn publish_call_membership_via_widget(
         "data": state_event.clone(),
         "response": {},
     });
+    let send_event_message_json = send_event_message.to_string();
+    info!(
+        request_body = send_event_message_json.as_str(),
+        "Publishing MatrixRTC membership send_event via widget api"
+    );
 
-    if !widget.handle.send(send_event_message.to_string()).await {
+    if !widget.handle.send(send_event_message_json).await {
         return Err(anyhow!("widget driver handle closed before sending membership send_event"));
     }
 
@@ -1241,8 +1246,13 @@ async fn publish_call_membership_via_widget(
         },
         "response": {},
     });
+    let update_state_message_json = update_state_message.to_string();
+    info!(
+        request_body = update_state_message_json.as_str(),
+        "Publishing MatrixRTC membership update_state via widget api"
+    );
 
-    if !widget.handle.send(update_state_message.to_string()).await {
+    if !widget.handle.send(update_state_message_json).await {
         return Err(anyhow!("widget driver handle closed before sending membership update_state"));
     }
 
