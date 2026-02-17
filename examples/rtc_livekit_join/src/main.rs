@@ -1195,7 +1195,7 @@ async fn publish_call_membership_via_widget(
         None,
         None,
     );
-    let response = room.send_state_event_for_key(state_key.as_ref(), content.clone()).await?;
+    let response = room.send_state_event_for_key(&state_key, content).await?;
     info!(
         event_id = %response.event_id,
         state_key = state_key.as_ref(),
