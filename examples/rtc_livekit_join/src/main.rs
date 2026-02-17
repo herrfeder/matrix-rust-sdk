@@ -1636,9 +1636,10 @@ fn register_room_message_key_probe_handler(
 ) -> EventHandlerDropGuard {
     info!(%room_id, "registering room message-like probe for encryption keys");
 
+    let room_id_for_handler = room_id.clone();
     let handle =
         client.add_room_event_handler(&room_id, move |raw: Raw<AnySyncMessageLikeEvent>| {
-            let room_id = room_id.clone();
+            let room_id = room_id_for_handler.clone();
             async move {
                 let event_type = raw
                     .get_field::<String>("type")
