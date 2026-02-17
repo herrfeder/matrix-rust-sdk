@@ -2,11 +2,11 @@
 
 use std::{env, fs};
 
-use anyhow::{anyhow, Context};
+use anyhow::{Context, anyhow};
 #[cfg(feature = "e2ee-per-participant")]
 use base64::{
-    engine::general_purpose::{STANDARD, STANDARD_NO_PAD, URL_SAFE, URL_SAFE_NO_PAD},
     Engine as _,
+    engine::general_purpose::{STANDARD, STANDARD_NO_PAD, URL_SAFE, URL_SAFE_NO_PAD},
 };
 #[cfg(feature = "e2e-encryption")]
 use futures_util::StreamExt;
@@ -15,10 +15,10 @@ use matrix_sdk::encryption::secret_storage::SecretStore;
 #[cfg(feature = "e2ee-per-participant")]
 use matrix_sdk::ruma::CanonicalJsonValue;
 use matrix_sdk::{
+    Client, RoomMemberships, RoomState,
     config::SyncSettings,
     event_handler::EventHandlerDropGuard,
     ruma::{OwnedRoomId, OwnedServerName, RoomId, RoomOrAliasId, ServerName},
-    Client, RoomMemberships, RoomState,
 };
 #[cfg(feature = "experimental-widgets")]
 use matrix_sdk::{
@@ -36,16 +36,16 @@ use matrix_sdk_base::crypto::CollectStrategy;
 use matrix_sdk_crypto::types::room_history::RoomKeyBundle;
 #[cfg(all(feature = "v4l2", target_os = "linux"))]
 use matrix_sdk_rtc::LiveKitError;
-use matrix_sdk_rtc::{livekit_service_url, LiveKitConnector, LiveKitResult};
+use matrix_sdk_rtc::{LiveKitConnector, LiveKitResult, livekit_service_url};
+#[cfg(feature = "e2ee-per-participant")]
+use matrix_sdk_rtc_livekit::livekit::RoomEvent;
 #[cfg(feature = "e2ee-per-participant")]
 use matrix_sdk_rtc_livekit::livekit::e2ee::{
-    key_provider::{KeyProvider, KeyProviderOptions},
     E2eeOptions, EncryptionType,
+    key_provider::{KeyProvider, KeyProviderOptions},
 };
 #[cfg(feature = "e2ee-per-participant")]
 use matrix_sdk_rtc_livekit::livekit::id::ParticipantIdentity;
-#[cfg(feature = "e2ee-per-participant")]
-use matrix_sdk_rtc_livekit::livekit::RoomEvent;
 use matrix_sdk_rtc_livekit::{
     LiveKitRoomOptionsProvider, LiveKitSdkConnector, LiveKitTokenProvider, Room, RoomOptions,
 };
@@ -242,8 +242,8 @@ fn configure_v4l2_device(
 )> {
     use matrix_sdk_rtc_livekit::livekit::webrtc::prelude::VideoResolution;
     use matrix_sdk_rtc_livekit::livekit::webrtc::video_source::native::NativeVideoSource;
-    use v4l::video::Capture;
     use v4l::Device;
+    use v4l::video::Capture;
 
     let mut device = Device::with_path(&config.device).context("open V4L2 device")?;
     let mut format = device.format().context("read V4L2 format")?;
@@ -365,8 +365,8 @@ fn set_format_with_fallback(
     device: &mut v4l::Device,
     mut format: v4l::format::Format,
 ) -> anyhow::Result<v4l::format::Format> {
-    use v4l::video::Capture;
     use v4l::FourCC;
+    use v4l::video::Capture;
 
     let nv12 = FourCC::new(b"NV12");
     let yuyv = FourCC::new(b"YUYV");
@@ -1195,58 +1195,41 @@ async fn publish_call_membership_via_widget(
         None,
         None,
     );
-    let now_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis();
-    let request_id = Uuid::new_v4().to_string();
-    let event_id = format!("$local-call-member-{now_ms}");
+    let response = room.send_state_event_for_key(&state_key, content).await?;
+    info!(
+        event_id = %response.event_id,
+        state_key = state_key.as_ref(),
+        "published MatrixRTC membership via room state event"
+    );
 
-    let state_event = serde_json::json!({
-        "type": "org.matrix.msc3401.call.member",
-        "sender": own_user_id.to_string(),
-        "content": content,
-        "state_key": state_key.as_ref(),
-        "origin_server_ts": now_ms,
-        "unsigned": {
-            "prev_content": {},
-            "prev_sender": own_user_id.to_string(),
-            "membership": "join",
-            "age": 0,
-        },
-        "event_id": event_id,
-        "room_id": room.room_id().to_string(),
-    });
+    // Keep this raw widget API send flow for debugging/reference, but do not execute it.
+    // It was useful for inspecting exact payloads and widget-machine behavior.
+    // let send_event_message = serde_json::json!({
+    //     "api": "fromWidget",
+    //     "widgetId": widget.widget_id,
+    //     "requestId": Uuid::new_v4().to_string(),
+    //     "action": "send_event",
+    //     "data": {
+    //         "type": "org.matrix.msc3401.call.member",
+    //         "state_key": state_key.as_ref(),
+    //         "content": content,
+    //         "room_id": room.room_id().to_string(),
+    //     },
+    // });
+    // let send_event_message_json = send_event_message.to_string();
+    // info!(
+    //     request_body = send_event_message_json.as_str(),
+    //     "Publishing MatrixRTC membership send_event via widget api"
+    // );
+    //
+    // if !widget.handle.send(send_event_message_json).await {
+    //     return Err(anyhow!("widget driver handle closed before sending membership send_event"));
+    // }
+    //
+    // info!(
+    //     "Skipping direct update_state send: update_state is a toWidget notification, not a fromWidget request"
+    // );
 
-    let send_event_message = serde_json::json!({
-        "api": "toWidget",
-        "widgetId": widget.widget_id,
-        "requestId": request_id,
-        "action": "send_event",
-        "data": state_event.clone(),
-        "response": {},
-    });
-
-    if !widget.handle.send(send_event_message.to_string()).await {
-        return Err(anyhow!("widget driver handle closed before sending membership send_event"));
-    }
-
-    let update_state_message = serde_json::json!({
-        "api": "toWidget",
-        "widgetId": widget.widget_id,
-        "requestId": Uuid::new_v4().to_string(),
-        "action": "update_state",
-        "data": {
-            "state": [state_event],
-        },
-        "response": {},
-    });
-
-    if !widget.handle.send(update_state_message.to_string()).await {
-        return Err(anyhow!("widget driver handle closed before sending membership update_state"));
-    }
-
-    info!(state_key = state_key.as_ref(), "published MatrixRTC membership via widget api");
     Ok(())
 }
 
@@ -1342,7 +1325,7 @@ async fn build_per_participant_e2ee(
     room: &matrix_sdk::Room,
 ) -> anyhow::Result<Option<PerParticipantE2eeContext>> {
     use matrix_sdk_rtc_livekit::matrix_keys::{
-        room_olm_machine, OlmMachineKeyMaterialProvider, PerParticipantKeyMaterialProvider,
+        OlmMachineKeyMaterialProvider, PerParticipantKeyMaterialProvider, room_olm_machine,
     };
 
     info!(room_id = %room.room_id(), "starting per-participant E2EE context build");
@@ -1444,8 +1427,8 @@ fn derive_per_participant_key() -> anyhow::Result<Vec<u8>> {
     //
     // In Element Call (matrix-js-sdk), the sender key seed is 16 bytes.
     // Keeping this at 16 bytes is important for interoperability with the LiveKit E2EE ratchet.
-    use rand::rngs::OsRng;
     use rand::RngCore;
+    use rand::rngs::OsRng;
 
     let mut key = [0u8; 16];
     OsRng.fill_bytes(&mut key);
@@ -1500,8 +1483,8 @@ async fn send_per_participant_keys(
     key: &[u8],
     target_device_id: Option<&str>,
 ) -> anyhow::Result<()> {
-    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use base64::Engine as _;
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 
     if key.is_empty() {
         info!(key_index, "per-participant E2EE key payload is empty; skipping send");
@@ -1626,9 +1609,10 @@ fn register_room_message_key_probe_handler(
 ) -> EventHandlerDropGuard {
     info!(%room_id, "registering room message-like probe for encryption keys");
 
+    let room_id_for_handler = room_id.clone();
     let handle =
         client.add_room_event_handler(&room_id, move |raw: Raw<AnySyncMessageLikeEvent>| {
-            let room_id = room_id.clone();
+            let room_id = room_id_for_handler.clone();
             async move {
                 let event_type = raw
                     .get_field::<String>("type")
