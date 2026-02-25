@@ -1,11 +1,16 @@
 //! LiveKit SDK integration for matrix-sdk-rtc.
 
 use async_trait::async_trait;
+use base64::{
+    engine::general_purpose::{URL_SAFE, URL_SAFE_NO_PAD},
+    Engine as _,
+};
 use matrix_sdk::Room as MatrixRoom;
 use matrix_sdk_rtc::{LiveKitConnection, LiveKitConnector, LiveKitError, LiveKitResult};
 
 pub use livekit;
 pub use livekit::e2ee;
+pub use livekit::id::ParticipantIdentity;
 use livekit::RoomEvent;
 pub use livekit::{ConnectionState, Room, RoomOptions};
 use tokio::sync::Mutex;
@@ -141,6 +146,18 @@ pub trait LiveKitTokenProvider: Send + Sync {
 pub trait LiveKitRoomOptionsProvider: Send + Sync {
     /// Create the LiveKit room options for the given Matrix room.
     fn room_options(&self, room: &MatrixRoom) -> RoomOptions;
+
+    /// Create LiveKit room options for the given Matrix room and local participant identity.
+    ///
+    /// By default this forwards to [`LiveKitRoomOptionsProvider::room_options`].
+    fn room_options_for_participant(
+        &self,
+        room: &MatrixRoom,
+        participant_identity: Option<&ParticipantIdentity>,
+    ) -> RoomOptions {
+        let _ = participant_identity;
+        self.room_options(room)
+    }
 }
 
 impl<F> LiveKitRoomOptionsProvider for F
@@ -150,6 +167,23 @@ where
     fn room_options(&self, room: &MatrixRoom) -> RoomOptions {
         (self)(room)
     }
+}
+
+fn local_participant_identity(room: &MatrixRoom) -> Option<ParticipantIdentity> {
+    let client = room.client();
+    let user_id = client.user_id()?;
+    let device_id = client.device_id()?;
+    Some(ParticipantIdentity(format!("{user_id}:{device_id}")))
+}
+
+fn participant_identity_from_token(token: &str) -> Option<ParticipantIdentity> {
+    let mut parts = token.split('.');
+    let _header = parts.next()?;
+    let payload = parts.next()?;
+    let payload = URL_SAFE_NO_PAD.decode(payload).or_else(|_| URL_SAFE.decode(payload)).ok()?;
+    let payload: serde_json::Value = serde_json::from_slice(&payload).ok()?;
+    let sub = payload.get("sub")?.as_str()?;
+    Some(ParticipantIdentity(sub.to_owned()))
 }
 
 /// A LiveKit connection backed by the LiveKit Rust SDK.
@@ -224,10 +258,23 @@ where
         room: &MatrixRoom,
     ) -> LiveKitResult<Self::Connection> {
         let token = self.token_provider.token(room).await?;
-        let room_options = self.room_options.room_options(room);
+        let room_options_provider = self.room_options_provider();
+        let participant_identity =
+            participant_identity_from_token(&token).or_else(|| local_participant_identity(room));
+        let mut room_options =
+            room_options_provider.room_options_for_participant(room, participant_identity.as_ref());
+
+        // Normalize deprecated `e2ee` options into `encryption` so callers that still
+        // populate `e2ee` continue to behave correctly when passed through to Room::connect.
+        // Prefer `encryption` when both are set.
+        if room_options.encryption.is_none() {
+            room_options.encryption = room_options.e2ee.take();
+        }
+
         info!(
             room_id = ?room.room_id(),
             service_url,
+            participant_identity = ?participant_identity,
             room_options = ?room_options,
             "connecting to LiveKit room with resolved room options"
         );

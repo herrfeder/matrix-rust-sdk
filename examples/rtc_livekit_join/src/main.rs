@@ -136,13 +136,23 @@ struct E2eeRoomOptionsProvider {
 
 #[cfg(feature = "e2ee-per-participant")]
 impl LiveKitRoomOptionsProvider for E2eeRoomOptionsProvider {
-    fn room_options(&self, _room: &matrix_sdk::Room) -> RoomOptions {
+    fn room_options(&self, room: &matrix_sdk::Room) -> RoomOptions {
+        self.room_options_for_participant(room, None)
+    }
+
+    fn room_options_for_participant(
+        &self,
+        _room: &matrix_sdk::Room,
+        participant_identity: Option<&ParticipantIdentity>,
+    ) -> RoomOptions {
         let mut options = RoomOptions::default();
         if let Some(context) = &self.e2ee {
-            options.encryption = Some(E2eeOptions {
-                encryption_type: EncryptionType::Gcm,
-                key_provider: KeyProvider::clone(context.key_provider.as_ref()),
-            });
+            let key_provider = KeyProvider::clone(context.key_provider.as_ref());
+            if let Some(identity) = participant_identity {
+                key_provider.set_key(identity, context.key_index, context.local_key.clone());
+            }
+            options.encryption =
+                Some(E2eeOptions { encryption_type: EncryptionType::Gcm, key_provider });
         }
         options
     }

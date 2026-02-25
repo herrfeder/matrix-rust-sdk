@@ -21,10 +21,12 @@ crypto = ["matrix-sdk-crypto", "matrix-sdk/e2e-encryption"]
 
 [dependencies]
 async-trait.workspace = true
+base64.workspace = true
 livekit = { git = "https://github.com/livekit/rust-sdks" }
 matrix-sdk.workspace = true
 matrix-sdk-rtc.workspace = true
 matrix-sdk-crypto = { workspace = true, optional = true }
+serde_json.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
