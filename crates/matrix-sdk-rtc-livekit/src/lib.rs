@@ -224,7 +224,16 @@ where
         room: &MatrixRoom,
     ) -> LiveKitResult<Self::Connection> {
         let token = self.token_provider.token(room).await?;
-        let room_options = self.room_options.room_options(room);
+        let room_options_provider = self.room_options_provider();
+        let mut room_options = room_options_provider.room_options(room);
+
+        // Normalize deprecated `e2ee` options into `encryption` so callers that still
+        // populate `e2ee` continue to behave correctly when passed through to Room::connect.
+        // Prefer `encryption` when both are set.
+        if room_options.encryption.is_none() {
+            room_options.encryption = room_options.e2ee.take();
+        }
+
         info!(
             room_id = ?room.room_id(),
             service_url,
