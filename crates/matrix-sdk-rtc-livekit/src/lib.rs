@@ -1,6 +1,10 @@
 //! LiveKit SDK integration for matrix-sdk-rtc.
 
 use async_trait::async_trait;
+use base64::{
+    engine::general_purpose::{URL_SAFE, URL_SAFE_NO_PAD},
+    Engine as _,
+};
 use matrix_sdk::Room as MatrixRoom;
 use matrix_sdk_rtc::{LiveKitConnection, LiveKitConnector, LiveKitError, LiveKitResult};
 
@@ -172,6 +176,16 @@ fn local_participant_identity(room: &MatrixRoom) -> Option<ParticipantIdentity> 
     Some(ParticipantIdentity(format!("{user_id}:{device_id}")))
 }
 
+fn participant_identity_from_token(token: &str) -> Option<ParticipantIdentity> {
+    let mut parts = token.split('.');
+    let _header = parts.next()?;
+    let payload = parts.next()?;
+    let payload = URL_SAFE_NO_PAD.decode(payload).or_else(|_| URL_SAFE.decode(payload)).ok()?;
+    let payload: serde_json::Value = serde_json::from_slice(&payload).ok()?;
+    let sub = payload.get("sub")?.as_str()?;
+    Some(ParticipantIdentity(sub.to_owned()))
+}
+
 /// A LiveKit connection backed by the LiveKit Rust SDK.
 #[derive(Debug)]
 pub struct LiveKitSdkConnection {
@@ -245,7 +259,8 @@ where
     ) -> LiveKitResult<Self::Connection> {
         let token = self.token_provider.token(room).await?;
         let room_options_provider = self.room_options_provider();
-        let participant_identity = local_participant_identity(room);
+        let participant_identity =
+            participant_identity_from_token(&token).or_else(|| local_participant_identity(room));
         let mut room_options =
             room_options_provider.room_options_for_participant(room, participant_identity.as_ref());
 
@@ -259,6 +274,7 @@ where
         info!(
             room_id = ?room.room_id(),
             service_url,
+            participant_identity = ?participant_identity,
             room_options = ?room_options,
             "connecting to LiveKit room with resolved room options"
         );
