@@ -6,6 +6,7 @@ use matrix_sdk_rtc::{LiveKitConnection, LiveKitConnector, LiveKitError, LiveKitR
 
 pub use livekit;
 pub use livekit::e2ee;
+pub use livekit::id::ParticipantIdentity;
 use livekit::RoomEvent;
 pub use livekit::{ConnectionState, Room, RoomOptions};
 use tokio::sync::Mutex;
@@ -141,6 +142,18 @@ pub trait LiveKitTokenProvider: Send + Sync {
 pub trait LiveKitRoomOptionsProvider: Send + Sync {
     /// Create the LiveKit room options for the given Matrix room.
     fn room_options(&self, room: &MatrixRoom) -> RoomOptions;
+
+    /// Create LiveKit room options for the given Matrix room and local participant identity.
+    ///
+    /// By default this forwards to [`LiveKitRoomOptionsProvider::room_options`].
+    fn room_options_for_participant(
+        &self,
+        room: &MatrixRoom,
+        participant_identity: Option<&ParticipantIdentity>,
+    ) -> RoomOptions {
+        let _ = participant_identity;
+        self.room_options(room)
+    }
 }
 
 impl<F> LiveKitRoomOptionsProvider for F
@@ -150,6 +163,13 @@ where
     fn room_options(&self, room: &MatrixRoom) -> RoomOptions {
         (self)(room)
     }
+}
+
+fn local_participant_identity(room: &MatrixRoom) -> Option<ParticipantIdentity> {
+    let client = room.client();
+    let user_id = client.user_id()?;
+    let device_id = client.device_id()?;
+    Some(ParticipantIdentity(format!("{user_id}:{device_id}")))
 }
 
 /// A LiveKit connection backed by the LiveKit Rust SDK.
@@ -225,7 +245,9 @@ where
     ) -> LiveKitResult<Self::Connection> {
         let token = self.token_provider.token(room).await?;
         let room_options_provider = self.room_options_provider();
-        let mut room_options = room_options_provider.room_options(room);
+        let participant_identity = local_participant_identity(room);
+        let mut room_options =
+            room_options_provider.room_options_for_participant(room, participant_identity.as_ref());
 
         // Normalize deprecated `e2ee` options into `encryption` so callers that still
         // populate `e2ee` continue to behave correctly when passed through to Room::connect.
