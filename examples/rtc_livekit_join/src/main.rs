@@ -44,7 +44,7 @@ use matrix_sdk_rtc::LiveKitError;
 use matrix_sdk_rtc::{livekit_service_url, LiveKitConnector, LiveKitResult};
 #[cfg(feature = "e2ee-per-participant")]
 use matrix_sdk_rtc_livekit::livekit::e2ee::{
-    key_provider::{KeyProvider, KeyProviderOptions},
+    key_provider::{KeyDerivationFunction, KeyProvider, KeyProviderOptions},
     E2eeOptions, EncryptionType,
 };
 #[cfg(feature = "e2ee-per-participant")]
@@ -115,7 +115,7 @@ impl LiveKitTokenProvider for EnvLiveKitTokenProvider {
 }
 
 impl LiveKitRoomOptionsProvider for DefaultRoomOptionsProvider {
-    fn room_options(&self, _room: &matrix_sdk::Room) -> RoomOptions {
+    fn room_options(&self) -> RoomOptions {
         RoomOptions::default()
     }
 }
@@ -136,7 +136,7 @@ struct E2eeRoomOptionsProvider {
 
 #[cfg(feature = "e2ee-per-participant")]
 impl LiveKitRoomOptionsProvider for E2eeRoomOptionsProvider {
-    fn room_options(&self, _room: &matrix_sdk::Room) -> RoomOptions {
+    fn room_options(&self) -> RoomOptions {
         let mut options = RoomOptions::default();
         if let Some(context) = &self.e2ee {
             options.encryption = Some(E2eeOptions {
@@ -273,7 +273,7 @@ fn configure_v4l2_capture_mode(
             width: config.width.unwrap_or(640),
             height: config.height.unwrap_or(480),
         };
-        let rtc_source = NativeVideoSource::new(resolution.clone());
+        let rtc_source = NativeVideoSource::new(resolution.clone(), true);
         info!(
             width = resolution.width,
             height = resolution.height,
@@ -314,7 +314,7 @@ fn configure_v4l2_capture_mode(
         fourcc = ?format.fourcc,
         "configured V4L2 device format"
     );
-    let rtc_source = NativeVideoSource::new(resolution.clone());
+    let rtc_source = NativeVideoSource::new(resolution.clone(), true);
     Ok((resolution, rtc_source, V4l2CaptureMode::Camera { device, pixel_format }))
 }
 
@@ -736,6 +736,23 @@ async fn main() -> anyhow::Result<()> {
     #[cfg(feature = "e2ee-per-participant")]
     let e2ee_context = build_per_participant_e2ee(&room).await?;
     #[cfg(feature = "e2ee-per-participant")]
+    if let Some(context) = e2ee_context.as_ref() {
+        if let (Some(user_id), Some(device_id)) = (client.user_id(), client.device_id()) {
+            let identity = ParticipantIdentity(format!("{user_id}:{device_id}"));
+            let key_set = context.key_provider.set_key(
+                &identity,
+                context.key_index,
+                context.local_key.clone(),
+            );
+            info!(
+                %identity,
+                key_index = context.key_index,
+                key_set,
+                "seeded local per-participant E2EE key_provider key before LiveKit connect"
+            );
+        }
+    }
+    #[cfg(feature = "e2ee-per-participant")]
     let _e2ee_to_device_guard = e2ee_context.as_ref().map(|context| {
         register_e2ee_to_device_handler(
             &client,
@@ -754,6 +771,13 @@ async fn main() -> anyhow::Result<()> {
     #[cfg(not(feature = "e2ee-per-participant"))]
     info!(
         "`e2ee-per-participant` feature is disabled; this device will not send io.element.call.encryption_keys to-device messages"
+    );
+    let resolved_room_options = room_options_provider.room_options();
+    info!(
+        room_options_provider_type = std::any::type_name_of_val(&room_options_provider),
+        room_options = ?resolved_room_options,
+        has_encryption_key_provider = resolved_room_options.encryption.is_some(),
+        "configured LiveKit room options provider"
     );
     let connector = LiveKitSdkConnector::new(token_provider, room_options_provider);
 
@@ -1604,7 +1628,12 @@ async fn build_per_participant_e2ee(
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
     }
     info!("proceeding with per-participant E2EE setup (sender key is freshly generated)");
-    let key_provider = std::sync::Arc::new(KeyProvider::new(KeyProviderOptions::default()));
+    let mut key_provider_options = KeyProviderOptions::default();
+    key_provider_options.ratchet_window_size = 10;
+    key_provider_options.key_ring_size = 256;
+    key_provider_options.key_derivation_function = KeyDerivationFunction::HKDF;
+
+    let key_provider = std::sync::Arc::new(KeyProvider::new(key_provider_options));
     let local_key = derive_per_participant_key()?;
     info!(
         room_id = %room.room_id(),
