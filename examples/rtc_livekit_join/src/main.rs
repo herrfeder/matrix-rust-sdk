@@ -1,10 +1,9 @@
 #![recursion_limit = "256"]
 
 #[cfg(feature = "experimental-widgets")]
-use std::{
-    collections::HashMap,
-    sync::{Arc, Mutex},
-};
+use std::collections::HashMap;
+#[cfg(any(feature = "experimental-widgets", all(feature = "v4l2", target_os = "linux")))]
+use std::sync::{Arc, Mutex};
 use std::{env, fs};
 
 use anyhow::{Context, anyhow};
@@ -65,7 +64,7 @@ use ruma::events::{AnySyncMessageLikeEvent, AnyToDeviceEvent};
 #[cfg(feature = "e2ee-per-participant")]
 use ruma::serde::Raw;
 use serde_json::Value as JsonValue;
-#[cfg(feature = "experimental-widgets")]
+#[cfg(any(feature = "experimental-widgets", all(feature = "v4l2", target_os = "linux")))]
 use tokio::io::{AsyncBufReadExt, BufReader};
 #[cfg(feature = "experimental-widgets")]
 use tokio::sync::{oneshot, watch};
@@ -185,6 +184,7 @@ struct V4l2CameraPublisher {
     track: matrix_sdk_rtc_livekit::livekit::track::LocalVideoTrack,
     stop_tx: std::sync::mpsc::Sender<()>,
     task: tokio::task::JoinHandle<anyhow::Result<()>>,
+    stdin_overlay_task: tokio::task::JoinHandle<()>,
 }
 
 #[cfg(all(feature = "v4l2", target_os = "linux"))]
@@ -203,6 +203,8 @@ impl V4l2CameraPublisher {
 
         let (resolution, rtc_source, capture_mode) =
             configure_v4l2_capture_mode(&config).context("configure V4L2 capture")?;
+        let overlay_text = Arc::new(Mutex::new(String::new()));
+        let stdin_overlay_task = spawn_stdin_overlay_task(overlay_text.clone());
 
         let track = matrix_sdk_rtc_livekit::livekit::track::LocalVideoTrack::create_video_track(
             "v4l2_camera",
@@ -227,20 +229,26 @@ impl V4l2CameraPublisher {
 
         let (stop_tx, stop_rx) = std::sync::mpsc::channel();
         let task = tokio::task::spawn_blocking(move || match capture_mode {
-            V4l2CaptureMode::Camera { mut device, pixel_format } => {
-                run_v4l2_capture_loop(&mut device, resolution, pixel_format, rtc_source, stop_rx)
-            }
+            V4l2CaptureMode::Camera { mut device, pixel_format } => run_v4l2_capture_loop(
+                &mut device,
+                resolution,
+                pixel_format,
+                rtc_source,
+                stop_rx,
+                overlay_text,
+            ),
             V4l2CaptureMode::TestRedFrames => {
                 run_generated_red_capture_loop(resolution, rtc_source, stop_rx)
             }
         });
 
-        Ok(Self { room, track, stop_tx, task })
+        Ok(Self { room, track, stop_tx, task, stdin_overlay_task })
     }
 
     async fn stop(self) -> anyhow::Result<()> {
         info!(room_name = %self.room.name(), "stopping V4L2 camera track");
         let _ = self.stop_tx.send(());
+        self.stdin_overlay_task.abort();
         let _ = self.task.await?;
         self.room
             .local_participant()
@@ -258,56 +266,63 @@ enum V4l2CaptureMode {
 }
 
 #[cfg(all(feature = "v4l2", target_os = "linux"))]
-fn select_default_v4l2_input(device: &v4l::Device) -> anyhow::Result<()> {
-    use std::{ffi::CStr, mem};
+fn spawn_stdin_overlay_task(overlay_text: Arc<Mutex<String>>) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let stdin = BufReader::new(tokio::io::stdin());
+        let mut lines = stdin.lines();
+        while let Ok(Some(line)) = lines.next_line().await {
+            if let Ok(mut shared) = overlay_text.lock() {
+                *shared = line;
+            }
+        }
+    })
+}
 
-    let handle = device.handle();
-    let fd = handle.fd();
-
-    let mut current_input: std::os::raw::c_int = 0;
-    unsafe {
-        v4l::v4l2::ioctl(
-            fd,
-            v4l::v4l2::vidioc::VIDIOC_G_INPUT,
-            &mut current_input as *mut _ as *mut std::os::raw::c_void,
-        )
+#[cfg(all(feature = "v4l2", target_os = "linux"))]
+fn overlay_text_on_i420(
+    text: &str,
+    resolution: &matrix_sdk_rtc_livekit::livekit::webrtc::prelude::VideoResolution,
+    dst_y: &mut [u8],
+    stride_y: u32,
+) {
+    let width = resolution.width as usize;
+    let height = resolution.height as usize;
+    let stride_y = stride_y as usize;
+    if width < 16 || height < 16 {
+        return;
     }
-    .context("get current V4L2 input")?;
 
-    if current_input == 0 {
-        return Ok(());
+    let text = text.trim();
+    if text.is_empty() {
+        return;
     }
 
-    let mut input0: v4l::v4l_sys::v4l2_input = unsafe { mem::zeroed() };
-    input0.index = 0;
-    unsafe {
-        v4l::v4l2::ioctl(
-            fd,
-            v4l::v4l2::vidioc::VIDIOC_ENUMINPUT,
-            &mut input0 as *mut _ as *mut std::os::raw::c_void,
-        )
+    let x0 = 8usize;
+    let y0 = height.saturating_sub(28);
+    let box_w = (text.chars().count() * 8 + 8).min(width.saturating_sub(x0));
+    let box_h = 20usize.min(height.saturating_sub(y0));
+
+    for y in 0..box_h {
+        let row = y0 + y;
+        let start = row * stride_y + x0;
+        let end = (start + box_w).min(row * stride_y + width);
+        dst_y[start..end].fill(32);
     }
-    .context("enumerate V4L2 input 0")?;
 
-    let mut input0_index: std::os::raw::c_int = 0;
-    unsafe {
-        v4l::v4l2::ioctl(
-            fd,
-            v4l::v4l2::vidioc::VIDIOC_S_INPUT,
-            &mut input0_index as *mut _ as *mut std::os::raw::c_void,
-        )
+    for (i, ch) in text.chars().take((box_w / 8).saturating_sub(1)).enumerate() {
+        let code = ch as u32;
+        for bit in 0..7 {
+            if (code >> bit) & 1 == 1 {
+                let x = x0 + 4 + i * 8 + bit;
+                for dy in 0..10 {
+                    let y = y0 + 5 + dy;
+                    if x < width && y < height {
+                        dst_y[y * stride_y + x] = 235;
+                    }
+                }
+            }
+        }
     }
-    .context("select V4L2 input 0")?;
-
-    let input_name = unsafe { CStr::from_ptr(input0.name.as_ptr().cast()) }.to_string_lossy();
-    info!(
-        previous_input = current_input,
-        selected_input = 0,
-        selected_input_name = %input_name,
-        "switched V4L2 device to input 0"
-    );
-
-    Ok(())
 }
 
 #[cfg(all(feature = "v4l2", target_os = "linux"))]
@@ -339,7 +354,6 @@ fn configure_v4l2_capture_mode(
     use v4l::video::Capture;
 
     let mut device = Device::with_path(&config.device).context("open V4L2 device")?;
-    select_default_v4l2_input(&device).context("select default V4L2 input")?;
     let mut format = device.format().context("read V4L2 format")?;
 
     if let Some(width) = config.width {
@@ -379,6 +393,7 @@ fn run_v4l2_capture_loop(
     pixel_format: V4l2PixelFormat,
     rtc_source: matrix_sdk_rtc_livekit::livekit::webrtc::video_source::native::NativeVideoSource,
     stop_rx: std::sync::mpsc::Receiver<()>,
+    overlay_text: Arc<Mutex<String>>,
 ) -> anyhow::Result<()> {
     use matrix_sdk_rtc_livekit::livekit::webrtc::native::yuv_helper;
     use matrix_sdk_rtc_livekit::livekit::webrtc::prelude::{I420Buffer, VideoFrame, VideoRotation};
@@ -456,6 +471,10 @@ fn run_v4l2_capture_loop(
                     data, width, stride, height, dst_y, stride_y, dst_u, stride_u, dst_v, stride_v,
                 );
             }
+        }
+
+        if let Ok(text) = overlay_text.lock() {
+            overlay_text_on_i420(&text, &resolution, dst_y, stride_y);
         }
 
         frame.timestamp_us = start.elapsed().as_micros() as i64;
@@ -611,7 +630,10 @@ fn v4l2_config_from_env() -> anyhow::Result<Option<V4l2Config>> {
     };
 
     let device = if matches!(source, V4l2VideoSource::Camera) {
-        optional_env("V4L2_DEVICE").unwrap_or_else(|| "/dev/video0".to_owned())
+        match optional_env("V4L2_DEVICE") {
+            Some(device) => device,
+            None => return Ok(None),
+        }
     } else {
         optional_env("V4L2_DEVICE").unwrap_or_else(|| "generated-test-source".to_owned())
     };
@@ -1336,19 +1358,6 @@ async fn start_element_call_widget(
             }
         }
         info!("widget -> rust-sdk message stream closed");
-    });
-
-    let inbound_handle = handle.clone();
-    tokio::spawn(async move {
-        let stdin = BufReader::new(tokio::io::stdin());
-        let mut lines = stdin.lines();
-        while let Ok(Some(line)) = lines.next_line().await {
-            if !inbound_handle.send(line).await {
-                break;
-            }
-            info!("stdin -> widget message forwarded");
-        }
-        info!("stdin -> widget message stream closed");
     });
 
     let content_loaded = serde_json::json!({
