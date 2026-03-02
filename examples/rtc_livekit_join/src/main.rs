@@ -2,8 +2,6 @@
 
 #[cfg(feature = "experimental-widgets")]
 use std::collections::HashMap;
-#[cfg(all(feature = "v4l2", target_os = "linux"))]
-use std::collections::VecDeque;
 #[cfg(any(feature = "experimental-widgets", all(feature = "v4l2", target_os = "linux")))]
 use std::sync::{Arc, Mutex};
 use std::{env, fs};
@@ -66,8 +64,6 @@ use ruma::events::{AnySyncMessageLikeEvent, AnyToDeviceEvent};
 #[cfg(feature = "e2ee-per-participant")]
 use ruma::serde::Raw;
 use serde_json::Value as JsonValue;
-#[cfg(all(feature = "v4l2", target_os = "linux"))]
-use tokio::io::AsyncReadExt;
 #[cfg(any(feature = "experimental-widgets", all(feature = "v4l2", target_os = "linux")))]
 use tokio::io::{AsyncBufReadExt, BufReader};
 #[cfg(feature = "experimental-widgets")]
@@ -207,8 +203,8 @@ impl V4l2CameraPublisher {
 
         let (resolution, rtc_source, capture_mode) =
             configure_v4l2_capture_mode(&config).context("configure V4L2 capture")?;
-        let snake = Arc::new(Mutex::new(SnakeGame::new(&resolution)));
-        let stdin_overlay_task = spawn_stdin_snake_task(snake.clone());
+        let text_overlay = Arc::new(Mutex::new(TextOverlayState::default()));
+        let stdin_overlay_task = spawn_stdin_text_task(text_overlay.clone());
 
         let track = matrix_sdk_rtc_livekit::livekit::track::LocalVideoTrack::create_video_track(
             "v4l2_camera",
@@ -239,7 +235,7 @@ impl V4l2CameraPublisher {
                 pixel_format,
                 rtc_source,
                 stop_rx,
-                snake,
+                text_overlay,
             ),
             V4l2CaptureMode::TestRedFrames => {
                 run_generated_red_capture_loop(resolution, rtc_source, stop_rx)
@@ -270,79 +266,15 @@ enum V4l2CaptureMode {
 }
 
 #[cfg(all(feature = "v4l2", target_os = "linux"))]
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-enum SnakeDirection {
-    Up,
-    Down,
-    Left,
-    Right,
+#[derive(Default)]
+struct TextOverlayState {
+    text: String,
+    phase: u8,
+    last_tick: Option<std::time::Instant>,
 }
 
 #[cfg(all(feature = "v4l2", target_os = "linux"))]
-struct SnakeGame {
-    cols: usize,
-    rows: usize,
-    cell_size: usize,
-    origin_x: usize,
-    origin_y: usize,
-    snake: VecDeque<(usize, usize)>,
-    direction: SnakeDirection,
-    next_direction: SnakeDirection,
-    food: (usize, usize),
-    last_tick: std::time::Instant,
-    rng_state: u32,
-    game_over: bool,
-}
-
-#[cfg(all(feature = "v4l2", target_os = "linux"))]
-impl SnakeGame {
-    fn new(resolution: &matrix_sdk_rtc_livekit::livekit::webrtc::prelude::VideoResolution) -> Self {
-        let width = resolution.width as usize;
-        let height = resolution.height as usize;
-        let cell_size = 16usize;
-        let cols = (width / cell_size).max(8);
-        let rows = (height / cell_size).max(6);
-        let board_w = cols.saturating_mul(cell_size);
-        let board_h = rows.saturating_mul(cell_size);
-        let origin_x = width.saturating_sub(board_w) / 2;
-        let origin_y = height.saturating_sub(board_h) / 2;
-
-        let mut snake = VecDeque::new();
-        snake.push_back((cols / 2, rows / 2));
-        snake.push_back((cols / 2 - 1, rows / 2));
-        snake.push_back((cols / 2 - 2, rows / 2));
-
-        let mut game = Self {
-            cols,
-            rows,
-            cell_size,
-            origin_x,
-            origin_y,
-            snake,
-            direction: SnakeDirection::Right,
-            next_direction: SnakeDirection::Right,
-            food: (1, 1),
-            last_tick: std::time::Instant::now(),
-            rng_state: ((resolution.width as u32) << 16) ^ (resolution.height as u32) ^ 0xA53C_9E21,
-            game_over: false,
-        };
-        game.spawn_food();
-        game
-    }
-
-    fn set_direction(&mut self, direction: SnakeDirection) {
-        let is_reverse = matches!(
-            (self.direction, direction),
-            (SnakeDirection::Up, SnakeDirection::Down)
-                | (SnakeDirection::Down, SnakeDirection::Up)
-                | (SnakeDirection::Left, SnakeDirection::Right)
-                | (SnakeDirection::Right, SnakeDirection::Left)
-        );
-        if !is_reverse {
-            self.next_direction = direction;
-        }
-    }
-
+impl TextOverlayState {
     fn tick_and_draw(
         &mut self,
         resolution: &matrix_sdk_rtc_livekit::livekit::webrtc::prelude::VideoResolution,
@@ -350,194 +282,174 @@ impl SnakeGame {
         stride_y: u32,
     ) {
         let now = std::time::Instant::now();
-        while now.duration_since(self.last_tick) >= std::time::Duration::from_millis(120) {
-            self.last_tick += std::time::Duration::from_millis(120);
-            self.tick_once();
+        let advance = self
+            .last_tick
+            .is_none_or(|last| now.duration_since(last) >= std::time::Duration::from_millis(120));
+        if advance {
+            self.phase = self.phase.wrapping_add(1);
+            self.last_tick = Some(now);
         }
-        self.draw(resolution, dst_y, stride_y);
+
+        draw_big_shiny_text(&self.text, self.phase, resolution, dst_y, stride_y);
+    }
+}
+
+#[cfg(all(feature = "v4l2", target_os = "linux"))]
+fn glyph_5x7(c: char) -> [u8; 7] {
+    match c.to_ascii_uppercase() {
+        'A' => [0b01110, 0b10001, 0b10001, 0b11111, 0b10001, 0b10001, 0b10001],
+        'B' => [0b11110, 0b10001, 0b10001, 0b11110, 0b10001, 0b10001, 0b11110],
+        'C' => [0b01111, 0b10000, 0b10000, 0b10000, 0b10000, 0b10000, 0b01111],
+        'D' => [0b11110, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b11110],
+        'E' => [0b11111, 0b10000, 0b10000, 0b11110, 0b10000, 0b10000, 0b11111],
+        'F' => [0b11111, 0b10000, 0b10000, 0b11110, 0b10000, 0b10000, 0b10000],
+        'G' => [0b01111, 0b10000, 0b10000, 0b10111, 0b10001, 0b10001, 0b01110],
+        'H' => [0b10001, 0b10001, 0b10001, 0b11111, 0b10001, 0b10001, 0b10001],
+        'I' => [0b11111, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0b11111],
+        'J' => [0b11111, 0b00010, 0b00010, 0b00010, 0b10010, 0b10010, 0b01100],
+        'K' => [0b10001, 0b10010, 0b10100, 0b11000, 0b10100, 0b10010, 0b10001],
+        'L' => [0b10000, 0b10000, 0b10000, 0b10000, 0b10000, 0b10000, 0b11111],
+        'M' => [0b10001, 0b11011, 0b10101, 0b10101, 0b10001, 0b10001, 0b10001],
+        'N' => [0b10001, 0b11001, 0b10101, 0b10011, 0b10001, 0b10001, 0b10001],
+        'O' => [0b01110, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01110],
+        'P' => [0b11110, 0b10001, 0b10001, 0b11110, 0b10000, 0b10000, 0b10000],
+        'Q' => [0b01110, 0b10001, 0b10001, 0b10001, 0b10101, 0b10010, 0b01101],
+        'R' => [0b11110, 0b10001, 0b10001, 0b11110, 0b10100, 0b10010, 0b10001],
+        'S' => [0b01111, 0b10000, 0b10000, 0b01110, 0b00001, 0b00001, 0b11110],
+        'T' => [0b11111, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100],
+        'U' => [0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01110],
+        'V' => [0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01010, 0b00100],
+        'W' => [0b10001, 0b10001, 0b10001, 0b10101, 0b10101, 0b10101, 0b01010],
+        'X' => [0b10001, 0b10001, 0b01010, 0b00100, 0b01010, 0b10001, 0b10001],
+        'Y' => [0b10001, 0b10001, 0b01010, 0b00100, 0b00100, 0b00100, 0b00100],
+        'Z' => [0b11111, 0b00001, 0b00010, 0b00100, 0b01000, 0b10000, 0b11111],
+        '0' => [0b01110, 0b10001, 0b10011, 0b10101, 0b11001, 0b10001, 0b01110],
+        '1' => [0b00100, 0b01100, 0b00100, 0b00100, 0b00100, 0b00100, 0b01110],
+        '2' => [0b01110, 0b10001, 0b00001, 0b00110, 0b01000, 0b10000, 0b11111],
+        '3' => [0b11110, 0b00001, 0b00001, 0b01110, 0b00001, 0b00001, 0b11110],
+        '4' => [0b00010, 0b00110, 0b01010, 0b10010, 0b11111, 0b00010, 0b00010],
+        '5' => [0b11111, 0b10000, 0b10000, 0b11110, 0b00001, 0b00001, 0b11110],
+        '6' => [0b01110, 0b10000, 0b10000, 0b11110, 0b10001, 0b10001, 0b01110],
+        '7' => [0b11111, 0b00001, 0b00010, 0b00100, 0b01000, 0b01000, 0b01000],
+        '8' => [0b01110, 0b10001, 0b10001, 0b01110, 0b10001, 0b10001, 0b01110],
+        '9' => [0b01110, 0b10001, 0b10001, 0b01111, 0b00001, 0b00001, 0b01110],
+        '!' => [0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0b00000, 0b00100],
+        '?' => [0b01110, 0b10001, 0b00001, 0b00110, 0b00100, 0b00000, 0b00100],
+        '.' => [0b00000, 0b00000, 0b00000, 0b00000, 0b00000, 0b00110, 0b00110],
+        ',' => [0b00000, 0b00000, 0b00000, 0b00000, 0b00110, 0b00110, 0b00100],
+        '-' => [0b00000, 0b00000, 0b00000, 0b01110, 0b00000, 0b00000, 0b00000],
+        ':' => [0b00000, 0b00110, 0b00110, 0b00000, 0b00110, 0b00110, 0b00000],
+        '/' => [0b00001, 0b00010, 0b00100, 0b01000, 0b10000, 0b00000, 0b00000],
+        ' ' => [0; 7],
+        _ => [0b11111, 0b10001, 0b00100, 0b00100, 0b00100, 0b10001, 0b11111],
+    }
+}
+
+#[cfg(all(feature = "v4l2", target_os = "linux"))]
+fn draw_big_shiny_text(
+    text: &str,
+    phase: u8,
+    resolution: &matrix_sdk_rtc_livekit::livekit::webrtc::prelude::VideoResolution,
+    dst_y: &mut [u8],
+    stride_y: u32,
+) {
+    let text = text.trim();
+    if text.is_empty() {
+        return;
     }
 
-    fn tick_once(&mut self) {
-        if self.game_over {
-            return;
-        }
+    let width = resolution.width as usize;
+    let height = resolution.height as usize;
+    let stride_y = stride_y as usize;
 
-        self.direction = self.next_direction;
-        let (mut x, mut y) = self.snake.front().copied().unwrap_or((0, 0));
-        match self.direction {
-            SnakeDirection::Up => y = y.saturating_sub(1),
-            SnakeDirection::Down => y += 1,
-            SnakeDirection::Left => x = x.saturating_sub(1),
-            SnakeDirection::Right => x += 1,
-        }
+    let scale = 6usize;
+    let char_w = 5 * scale;
+    let char_h = 7 * scale;
+    let spacing = scale + 2;
+    let max_chars = ((width.saturating_sub(20)) / (char_w + spacing)).max(1);
+    let visible: Vec<char> = text.chars().take(max_chars).collect();
+    let total_w = visible.len().saturating_mul(char_w + spacing).saturating_sub(spacing);
+    let x0 = (width.saturating_sub(total_w)) / 2;
+    let y0 = (height.saturating_sub(char_h)) / 2;
 
-        if x >= self.cols || y >= self.rows || self.snake.iter().any(|&(sx, sy)| sx == x && sy == y)
-        {
-            self.game_over = true;
-            return;
-        }
+    let pad = 12usize;
+    fill_rect(
+        dst_y,
+        stride_y,
+        width,
+        height,
+        x0.saturating_sub(pad),
+        y0.saturating_sub(pad),
+        total_w + pad * 2,
+        char_h + pad * 2,
+        18,
+    );
 
-        self.snake.push_front((x, y));
-        if (x, y) == self.food {
-            self.spawn_food();
-        } else {
-            let _ = self.snake.pop_back();
-        }
-    }
+    for (i, ch) in visible.iter().enumerate() {
+        let glyph = glyph_5x7(*ch);
+        let gx = x0 + i * (char_w + spacing);
 
-    fn spawn_food(&mut self) {
-        for _ in 0..(self.cols * self.rows).max(1) {
-            self.rng_state = self.rng_state.wrapping_mul(1664525).wrapping_add(1013904223);
-            let x = (self.rng_state as usize) % self.cols;
-            self.rng_state = self.rng_state.wrapping_mul(1664525).wrapping_add(1013904223);
-            let y = (self.rng_state as usize) % self.rows;
-            if !self.snake.iter().any(|&(sx, sy)| sx == x && sy == y) {
-                self.food = (x, y);
-                return;
-            }
-        }
-    }
+        for (row, bits) in glyph.iter().copied().enumerate() {
+            for col in 0..5 {
+                if (bits >> (4 - col)) & 1 == 1 {
+                    let px = gx + col * scale;
+                    let py = y0 + row * scale;
+                    let shimmer = (((phase as usize + i + row + col) % 6) * 6) as u8;
+                    let bright = 190u8.saturating_add(shimmer);
+                    fill_rect(dst_y, stride_y, width, height, px, py, scale, scale, bright);
 
-    fn draw(
-        &self,
-        resolution: &matrix_sdk_rtc_livekit::livekit::webrtc::prelude::VideoResolution,
-        dst_y: &mut [u8],
-        stride_y: u32,
-    ) {
-        let width = resolution.width as usize;
-        let height = resolution.height as usize;
-        let stride_y = stride_y as usize;
-
-        self.fill_rect(
-            dst_y,
-            stride_y,
-            width,
-            height,
-            self.origin_x,
-            self.origin_y,
-            self.cols * self.cell_size,
-            self.rows * self.cell_size,
-            24,
-        );
-
-        for &(x, y) in &self.snake {
-            self.fill_rect(
-                dst_y,
-                stride_y,
-                width,
-                height,
-                self.origin_x + x * self.cell_size + 1,
-                self.origin_y + y * self.cell_size + 1,
-                self.cell_size.saturating_sub(2),
-                self.cell_size.saturating_sub(2),
-                210,
-            );
-        }
-
-        self.fill_rect(
-            dst_y,
-            stride_y,
-            width,
-            height,
-            self.origin_x + self.food.0 * self.cell_size + 2,
-            self.origin_y + self.food.1 * self.cell_size + 2,
-            self.cell_size.saturating_sub(4),
-            self.cell_size.saturating_sub(4),
-            96,
-        );
-
-        if self.game_over {
-            self.fill_rect(
-                dst_y,
-                stride_y,
-                width,
-                height,
-                self.origin_x + self.cell_size,
-                self.origin_y + self.cell_size,
-                (self.cols.saturating_sub(2)) * self.cell_size,
-                (self.rows.saturating_sub(2)) * self.cell_size,
-                64,
-            );
-        }
-    }
-
-    fn fill_rect(
-        &self,
-        dst_y: &mut [u8],
-        stride_y: usize,
-        width: usize,
-        height: usize,
-        x: usize,
-        y: usize,
-        w: usize,
-        h: usize,
-        value: u8,
-    ) {
-        let x2 = (x + w).min(width);
-        let y2 = (y + h).min(height);
-        for row in y..y2 {
-            let start = row * stride_y + x;
-            let end = row * stride_y + x2;
-            if start < dst_y.len() && end <= dst_y.len() && start < end {
-                dst_y[start..end].fill(value);
+                    if px + scale < width && py + scale < height {
+                        fill_rect(
+                            dst_y,
+                            stride_y,
+                            width,
+                            height,
+                            px + scale / 2,
+                            py + scale / 2,
+                            scale / 2,
+                            scale / 2,
+                            235,
+                        );
+                    }
+                }
             }
         }
     }
 }
 
 #[cfg(all(feature = "v4l2", target_os = "linux"))]
-fn spawn_stdin_snake_task(snake: Arc<Mutex<SnakeGame>>) -> tokio::task::JoinHandle<()> {
+fn fill_rect(
+    dst_y: &mut [u8],
+    stride_y: usize,
+    width: usize,
+    height: usize,
+    x: usize,
+    y: usize,
+    w: usize,
+    h: usize,
+    value: u8,
+) {
+    let x2 = (x + w).min(width);
+    let y2 = (y + h).min(height);
+    for row in y..y2 {
+        let start = row * stride_y + x;
+        let end = row * stride_y + x2;
+        if start < dst_y.len() && end <= dst_y.len() && start < end {
+            dst_y[start..end].fill(value);
+        }
+    }
+}
+
+#[cfg(all(feature = "v4l2", target_os = "linux"))]
+fn spawn_stdin_text_task(
+    text_overlay: Arc<Mutex<TextOverlayState>>,
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        let mut stdin = tokio::io::stdin();
-        let mut buf = [0u8; 1];
-        let mut saw_escape = false;
-        let mut saw_bracket = false;
-
-        loop {
-            let Ok(read) = stdin.read(&mut buf).await else {
-                break;
-            };
-            if read == 0 {
-                break;
-            }
-
-            let byte = buf[0];
-            let mut direction = None;
-
-            if saw_escape {
-                if !saw_bracket && byte == b'[' {
-                    saw_bracket = true;
-                    continue;
-                }
-                if saw_bracket {
-                    direction = match byte {
-                        b'A' => Some(SnakeDirection::Up),
-                        b'B' => Some(SnakeDirection::Down),
-                        b'C' => Some(SnakeDirection::Right),
-                        b'D' => Some(SnakeDirection::Left),
-                        _ => None,
-                    };
-                }
-                saw_escape = false;
-                saw_bracket = false;
-            } else if byte == 0x1b {
-                saw_escape = true;
-                saw_bracket = false;
-                continue;
-            } else {
-                direction = match byte {
-                    b'w' | b'W' => Some(SnakeDirection::Up),
-                    b's' | b'S' => Some(SnakeDirection::Down),
-                    b'a' | b'A' => Some(SnakeDirection::Left),
-                    b'd' | b'D' => Some(SnakeDirection::Right),
-                    _ => None,
-                };
-            }
-
-            if let Some(direction) = direction {
-                if let Ok(mut snake) = snake.lock() {
-                    snake.set_direction(direction);
-                }
+        let stdin = BufReader::new(tokio::io::stdin());
+        let mut lines = stdin.lines();
+        while let Ok(Some(line)) = lines.next_line().await {
+            if let Ok(mut overlay) = text_overlay.lock() {
+                overlay.text = line;
             }
         }
     })
@@ -611,7 +523,7 @@ fn run_v4l2_capture_loop(
     pixel_format: V4l2PixelFormat,
     rtc_source: matrix_sdk_rtc_livekit::livekit::webrtc::video_source::native::NativeVideoSource,
     stop_rx: std::sync::mpsc::Receiver<()>,
-    snake: Arc<Mutex<SnakeGame>>,
+    text_overlay: Arc<Mutex<TextOverlayState>>,
 ) -> anyhow::Result<()> {
     use matrix_sdk_rtc_livekit::livekit::webrtc::native::yuv_helper;
     use matrix_sdk_rtc_livekit::livekit::webrtc::prelude::{I420Buffer, VideoFrame, VideoRotation};
@@ -691,8 +603,8 @@ fn run_v4l2_capture_loop(
             }
         }
 
-        if let Ok(mut snake) = snake.lock() {
-            snake.tick_and_draw(&resolution, dst_y, stride_y);
+        if let Ok(mut overlay) = text_overlay.lock() {
+            overlay.tick_and_draw(&resolution, dst_y, stride_y);
         }
 
         frame.timestamp_us = start.elapsed().as_micros() as i64;
