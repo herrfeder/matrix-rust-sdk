@@ -258,6 +258,59 @@ enum V4l2CaptureMode {
 }
 
 #[cfg(all(feature = "v4l2", target_os = "linux"))]
+fn select_default_v4l2_input(device: &v4l::Device) -> anyhow::Result<()> {
+    use std::{ffi::CStr, mem};
+
+    let handle = device.handle();
+    let fd = handle.fd();
+
+    let mut current_input: std::os::raw::c_int = 0;
+    unsafe {
+        v4l::v4l2::ioctl(
+            fd,
+            v4l::v4l2::vidioc::VIDIOC_G_INPUT,
+            &mut current_input as *mut _ as *mut std::os::raw::c_void,
+        )
+    }
+    .context("get current V4L2 input")?;
+
+    if current_input == 0 {
+        return Ok(());
+    }
+
+    let mut input0: v4l::v4l_sys::v4l2_input = unsafe { mem::zeroed() };
+    input0.index = 0;
+    unsafe {
+        v4l::v4l2::ioctl(
+            fd,
+            v4l::v4l2::vidioc::VIDIOC_ENUMINPUT,
+            &mut input0 as *mut _ as *mut std::os::raw::c_void,
+        )
+    }
+    .context("enumerate V4L2 input 0")?;
+
+    let mut input0_index: std::os::raw::c_int = 0;
+    unsafe {
+        v4l::v4l2::ioctl(
+            fd,
+            v4l::v4l2::vidioc::VIDIOC_S_INPUT,
+            &mut input0_index as *mut _ as *mut std::os::raw::c_void,
+        )
+    }
+    .context("select V4L2 input 0")?;
+
+    let input_name = unsafe { CStr::from_ptr(input0.name.as_ptr().cast()) }.to_string_lossy();
+    info!(
+        previous_input = current_input,
+        selected_input = 0,
+        selected_input_name = %input_name,
+        "switched V4L2 device to input 0"
+    );
+
+    Ok(())
+}
+
+#[cfg(all(feature = "v4l2", target_os = "linux"))]
 fn configure_v4l2_capture_mode(
     config: &V4l2Config,
 ) -> anyhow::Result<(
@@ -286,6 +339,7 @@ fn configure_v4l2_capture_mode(
     use v4l::video::Capture;
 
     let mut device = Device::with_path(&config.device).context("open V4L2 device")?;
+    select_default_v4l2_input(&device).context("select default V4L2 input")?;
     let mut format = device.format().context("read V4L2 format")?;
 
     if let Some(width) = config.width {
@@ -557,10 +611,7 @@ fn v4l2_config_from_env() -> anyhow::Result<Option<V4l2Config>> {
     };
 
     let device = if matches!(source, V4l2VideoSource::Camera) {
-        match optional_env("V4L2_DEVICE") {
-            Some(device) => device,
-            None => return Ok(None),
-        }
+        optional_env("V4L2_DEVICE").unwrap_or_else(|| "/dev/video0".to_owned())
     } else {
         optional_env("V4L2_DEVICE").unwrap_or_else(|| "generated-test-source".to_owned())
     };

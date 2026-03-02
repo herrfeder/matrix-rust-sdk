@@ -41,8 +41,9 @@ cargo run -p example-rtc-livekit-join --features experimental-widgets
 ## V4L2 camera publishing (Linux)
 
 This example can publish a local V4L2 camera (e.g. `/dev/video0`) into the
-LiveKit room using the LiveKit Rust SDK. Enable the feature and provide the
-device path:
+LiveKit room using the LiveKit Rust SDK. By default it uses `/dev/video0`
+and selects V4L2 input index `0` (the normal/default input on multi-input
+devices). `V4L2_DEVICE` can still be used to override the device path:
 
 ```bash
 HOMESERVER_URL=https://matrix.example.org \
@@ -51,7 +52,6 @@ MATRIX_PASSWORD=secret \
 ROOM_ID=!roomid:example.org \
 LIVEKIT_SERVICE_URL=wss://livekit.example.org \
 LIVEKIT_TOKEN=your-token \
-V4L2_DEVICE=/dev/video0 \
 V4L2_VIDEO_SOURCE=camera \
 V4L2_WIDTH=1280 \
 V4L2_HEIGHT=720 \
@@ -97,6 +97,7 @@ Notes:
 
 - `V4L2_VIDEO_SOURCE` selects the published source: `camera`/`webcam` (default)
   or `test_red`/`test-red`/`red` for generated red frames.
+- `V4L2_DEVICE` is optional in camera mode and defaults to `/dev/video0`.
 - `V4L2_WIDTH` and `V4L2_HEIGHT` are optional; for camera mode, the current
   device format is used when omitted. For generated red frames, they default to
   640x480.
