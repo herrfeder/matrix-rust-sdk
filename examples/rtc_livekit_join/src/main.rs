@@ -280,6 +280,10 @@ impl TextOverlayState {
         resolution: &matrix_sdk_rtc_livekit::livekit::webrtc::prelude::VideoResolution,
         dst_y: &mut [u8],
         stride_y: u32,
+        dst_u: &mut [u8],
+        stride_u: u32,
+        dst_v: &mut [u8],
+        stride_v: u32,
     ) {
         let now = std::time::Instant::now();
         let advance = self
@@ -290,7 +294,9 @@ impl TextOverlayState {
             self.last_tick = Some(now);
         }
 
-        draw_big_shiny_text(&self.text, self.phase, resolution, dst_y, stride_y);
+        draw_big_shiny_text(
+            &self.text, self.phase, resolution, dst_y, stride_y, dst_u, stride_u, dst_v, stride_v,
+        );
     }
 }
 
@@ -352,6 +358,10 @@ fn draw_big_shiny_text(
     resolution: &matrix_sdk_rtc_livekit::livekit::webrtc::prelude::VideoResolution,
     dst_y: &mut [u8],
     stride_y: u32,
+    dst_u: &mut [u8],
+    stride_u: u32,
+    dst_v: &mut [u8],
+    stride_v: u32,
 ) {
     let text = text.trim();
     if text.is_empty() {
@@ -373,9 +383,13 @@ fn draw_big_shiny_text(
     let y0 = (height.saturating_sub(char_h)) / 2;
 
     let pad = 12usize;
-    fill_rect(
+    fill_rect_i420(
         dst_y,
         stride_y,
+        dst_u,
+        stride_u,
+        dst_v,
+        stride_v,
         width,
         height,
         x0.saturating_sub(pad),
@@ -383,6 +397,8 @@ fn draw_big_shiny_text(
         total_w + pad * 2,
         char_h + pad * 2,
         18,
+        128,
+        128,
     );
 
     for (i, ch) in visible.iter().enumerate() {
@@ -396,12 +412,29 @@ fn draw_big_shiny_text(
                     let py = y0 + row * scale;
                     let shimmer = (((phase as usize + i + row + col) % 6) * 6) as u8;
                     let bright = 190u8.saturating_add(shimmer);
-                    fill_rect(dst_y, stride_y, width, height, px, py, scale, scale, bright);
+                    let rainbow_index = (phase as usize + i + row + col) % 7;
+                    let (u, v) = match rainbow_index {
+                        0 => (90, 240),
+                        1 => (54, 34),
+                        2 => (34, 163),
+                        3 => (16, 146),
+                        4 => (166, 16),
+                        5 => (202, 222),
+                        _ => (240, 110),
+                    };
+                    fill_rect_i420(
+                        dst_y, stride_y, dst_u, stride_u, dst_v, stride_v, width, height, px, py,
+                        scale, scale, bright, u, v,
+                    );
 
                     if px + scale < width && py + scale < height {
-                        fill_rect(
+                        fill_rect_i420(
                             dst_y,
                             stride_y,
+                            dst_u,
+                            stride_u,
+                            dst_v,
+                            stride_v,
                             width,
                             height,
                             px + scale / 2,
@@ -409,6 +442,8 @@ fn draw_big_shiny_text(
                             scale / 2,
                             scale / 2,
                             235,
+                            128,
+                            128,
                         );
                     }
                 }
@@ -418,24 +453,54 @@ fn draw_big_shiny_text(
 }
 
 #[cfg(all(feature = "v4l2", target_os = "linux"))]
-fn fill_rect(
+fn fill_rect_i420(
     dst_y: &mut [u8],
     stride_y: usize,
+    dst_u: &mut [u8],
+    stride_u: u32,
+    dst_v: &mut [u8],
+    stride_v: u32,
     width: usize,
     height: usize,
     x: usize,
     y: usize,
     w: usize,
     h: usize,
-    value: u8,
+    y_value: u8,
+    u_value: u8,
+    v_value: u8,
 ) {
     let x2 = (x + w).min(width);
     let y2 = (y + h).min(height);
+
     for row in y..y2 {
         let start = row * stride_y + x;
         let end = row * stride_y + x2;
         if start < dst_y.len() && end <= dst_y.len() && start < end {
-            dst_y[start..end].fill(value);
+            dst_y[start..end].fill(y_value);
+        }
+    }
+
+    let stride_u = stride_u as usize;
+    let stride_v = stride_v as usize;
+    let uv_x = x / 2;
+    let uv_x2 = x2.div_ceil(2);
+    let uv_y = y / 2;
+    let uv_y2 = y2.div_ceil(2);
+
+    for row in uv_y..uv_y2 {
+        let start = row * stride_u + uv_x;
+        let end = row * stride_u + uv_x2;
+        if start < dst_u.len() && end <= dst_u.len() && start < end {
+            dst_u[start..end].fill(u_value);
+        }
+    }
+
+    for row in uv_y..uv_y2 {
+        let start = row * stride_v + uv_x;
+        let end = row * stride_v + uv_x2;
+        if start < dst_v.len() && end <= dst_v.len() && start < end {
+            dst_v[start..end].fill(v_value);
         }
     }
 }
@@ -604,7 +669,7 @@ fn run_v4l2_capture_loop(
         }
 
         if let Ok(mut overlay) = text_overlay.lock() {
-            overlay.tick_and_draw(&resolution, dst_y, stride_y);
+            overlay.tick_and_draw(&resolution, dst_y, stride_y, dst_u, stride_u, dst_v, stride_v);
         }
 
         frame.timestamp_us = start.elapsed().as_micros() as i64;
