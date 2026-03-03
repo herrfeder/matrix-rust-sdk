@@ -100,6 +100,8 @@ Notes:
 - `V4L2_WIDTH` and `V4L2_HEIGHT` are optional; for camera mode, the current
   device format is used when omitted. For generated red frames, they default to
   640x480.
+- Text read from `stdin` is overlaid in the middle of outgoing camera frames using
+  large shiny letters.
 
 ## Build notes (Linux)
 
