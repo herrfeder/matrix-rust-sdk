@@ -14,17 +14,18 @@ use livekit::{
     },
     id::ParticipantIdentity,
 };
-use matrix_sdk::{Client, EventHandlerDropGuard, Room, RoomMemberships};
+use matrix_sdk::{Client, Room, RoomMemberships, event_handler::EventHandlerDropGuard};
 use matrix_sdk_base::crypto::CollectStrategy;
 use rand::{RngCore, rngs::OsRng};
-use ruma::events::AnyToDeviceEvent;
 use ruma::serde::Raw;
+use ruma::{OwnedRoomId, events::AnyToDeviceEvent};
 use thiserror::Error;
 use tracing::info;
 
 use crate::LiveKitRoomOptionsProvider;
 use crate::matrix_keys::{
-    OlmMachineKeyMaterialProvider, PerParticipantKeyMaterialProvider, room_olm_machine,
+    MatrixKeyMaterialError, OlmMachineKeyMaterialProvider, PerParticipantKeyMaterialProvider,
+    room_olm_machine,
 };
 
 /// Runtime context for per-participant LiveKit E2EE.
@@ -64,6 +65,8 @@ pub enum PerParticipantE2eeError {
     Matrix(#[from] matrix_sdk::Error),
     #[error(transparent)]
     Serde(#[from] serde_json::Error),
+    #[error(transparent)]
+    MatrixKeys(#[from] MatrixKeyMaterialError),
 }
 
 /// Build the initial per-participant E2EE context for a Matrix room.
@@ -204,7 +207,7 @@ pub async fn send_per_participant_keys(
 /// Register a to-device handler that applies received per-participant keys.
 pub fn register_e2ee_to_device_handler(
     client: &Client,
-    room_id: matrix_sdk::ruma::OwnedRoomId,
+    room_id: OwnedRoomId,
     key_provider: Arc<KeyProvider>,
 ) -> EventHandlerDropGuard {
     let seen_first_event = Arc::new(std::sync::atomic::AtomicBool::new(false));
