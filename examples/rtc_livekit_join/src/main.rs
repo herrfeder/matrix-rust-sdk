@@ -6,23 +6,16 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::{env, fs};
 
-use anyhow::{anyhow, Context};
-#[cfg(feature = "e2ee-per-participant")]
-use base64::{
-    engine::general_purpose::{STANDARD, STANDARD_NO_PAD, URL_SAFE, URL_SAFE_NO_PAD},
-    Engine as _,
-};
-#[cfg(feature = "e2e-encryption")]
+use anyhow::{Context, anyhow};
+#[cfg(any(feature = "e2ee-per-participant", feature = "e2e-encryption"))]
 use futures_util::StreamExt;
 #[cfg(feature = "e2e-encryption")]
 use matrix_sdk::encryption::secret_storage::SecretStore;
-#[cfg(feature = "e2ee-per-participant")]
-use matrix_sdk::ruma::CanonicalJsonValue;
 use matrix_sdk::{
+    Client, RoomState,
     config::SyncSettings,
     event_handler::EventHandlerDropGuard,
     ruma::{OwnedRoomId, OwnedServerName, RoomId, RoomOrAliasId, ServerName},
-    Client, RoomMemberships, RoomState,
 };
 #[cfg(feature = "experimental-widgets")]
 use matrix_sdk::{
@@ -34,22 +27,17 @@ use matrix_sdk::{
         WidgetSettings,
     },
 };
-#[cfg(feature = "e2ee-per-participant")]
-use matrix_sdk_base::crypto::CollectStrategy;
-#[cfg(feature = "e2ee-per-participant")]
-use matrix_sdk_crypto::types::room_history::RoomKeyBundle;
 #[cfg(all(feature = "v4l2", target_os = "linux"))]
 use matrix_sdk_rtc::LiveKitError;
-use matrix_sdk_rtc::{livekit_service_url, LiveKitConnector, LiveKitResult};
-#[cfg(feature = "e2ee-per-participant")]
-use matrix_sdk_rtc_livekit::livekit::e2ee::{
-    key_provider::{KeyDerivationFunction, KeyProvider, KeyProviderOptions},
-    E2eeOptions, EncryptionType,
-};
+use matrix_sdk_rtc::{LiveKitConnector, LiveKitResult, livekit_service_url};
 #[cfg(feature = "e2ee-per-participant")]
 use matrix_sdk_rtc_livekit::livekit::id::ParticipantIdentity;
 #[cfg(feature = "e2ee-per-participant")]
-use matrix_sdk_rtc_livekit::livekit::RoomEvent;
+use matrix_sdk_rtc_livekit::per_participant::{
+    E2eeRoomOptionsProvider, PerParticipantE2eeContext, build_per_participant_e2ee,
+    per_participant_key_grace_period_from_env, register_e2ee_to_device_handler,
+    send_per_participant_keys, spawn_livekit_e2ee_event_resend,
+};
 use matrix_sdk_rtc_livekit::{
     LiveKitRoomOptionsProvider, LiveKitSdkConnector, LiveKitTokenProvider, Room, RoomOptions,
 };
@@ -118,38 +106,10 @@ impl LiveKitRoomOptionsProvider for DefaultRoomOptionsProvider {
     }
 }
 
-#[cfg(feature = "e2ee-per-participant")]
-#[derive(Clone)]
-struct PerParticipantE2eeContext {
-    key_provider: std::sync::Arc<KeyProvider>,
-    key_index: i32,
-    local_key: Vec<u8>,
-}
-
-#[cfg(feature = "e2ee-per-participant")]
-#[derive(Clone)]
-struct E2eeRoomOptionsProvider {
-    e2ee: Option<PerParticipantE2eeContext>,
-}
-
-#[cfg(feature = "e2ee-per-participant")]
-impl LiveKitRoomOptionsProvider for E2eeRoomOptionsProvider {
-    fn room_options(&self) -> RoomOptions {
-        let mut options = RoomOptions::default();
-        if let Some(context) = &self.e2ee {
-            options.encryption = Some(E2eeOptions {
-                encryption_type: EncryptionType::Gcm,
-                key_provider: KeyProvider::clone(context.key_provider.as_ref()),
-            });
-        }
-        options
-    }
-}
-
 #[cfg(all(feature = "v4l2", target_os = "linux"))]
 mod videosource;
 #[cfg(all(feature = "v4l2", target_os = "linux"))]
-use videosource::{v4l2_config_from_env, V4l2CameraPublisher, V4l2Config, V4l2PublishError};
+use videosource::{V4l2CameraPublisher, V4l2Config, V4l2PublishError, v4l2_config_from_env};
 
 #[cfg(not(all(feature = "v4l2", target_os = "linux")))]
 fn v4l2_config_from_env() -> anyhow::Result<()> {
@@ -317,7 +277,13 @@ async fn main() -> anyhow::Result<()> {
 
     let token_provider = EnvLiveKitTokenProvider { token: livekit_token.clone() };
     #[cfg(feature = "e2ee-per-participant")]
-    let e2ee_context = build_per_participant_e2ee(&room).await?;
+    let e2ee_context = build_per_participant_e2ee(
+        &room,
+        bool_env("PER_PARTICIPANT_FORCE_BACKUP_DOWNLOAD"),
+        retry_attempts_from_env("PER_PARTICIPANT_KEY_RETRIES", 0),
+        std::time::Duration::from_secs(1),
+    )
+    .await?;
     #[cfg(feature = "e2ee-per-participant")]
     if let Some(context) = e2ee_context.as_ref() {
         if let (Some(user_id), Some(device_id)) = (client.user_id(), client.device_id()) {
@@ -529,97 +495,6 @@ fn spawn_periodic_e2ee_key_resend(room: matrix_sdk::Room, context: PerParticipan
             }
         }
     });
-}
-
-#[cfg(feature = "e2ee-per-participant")]
-fn spawn_livekit_e2ee_event_resend(
-    room: matrix_sdk::Room,
-    mut events: tokio::sync::mpsc::UnboundedReceiver<RoomEvent>,
-    context: PerParticipantE2eeContext,
-) {
-    tokio::spawn(async move {
-        while let Some(event) = events.recv().await {
-            match event {
-                RoomEvent::Reconnected => {
-                    info!(
-                        key_index = context.key_index,
-                        "LiveKit reconnected; resending per-participant E2EE keys"
-                    );
-                    if let Err(err) = send_per_participant_keys(
-                        &room,
-                        context.key_index,
-                        &context.local_key,
-                        None,
-                    )
-                    .await
-                    {
-                        info!(
-                            ?err,
-                            "failed to resend per-participant E2EE keys on LiveKit reconnect"
-                        );
-                    }
-                }
-                RoomEvent::ParticipantConnected(participant) => {
-                    let participant_identity = participant.identity();
-                    let target_device_id = participant_identity
-                        .as_str()
-                        .rsplit_once(':')
-                        .map(|(_, device_id)| device_id.to_owned());
-                    info!(
-                        participant_identity = %participant_identity,
-                        key_index = context.key_index,
-                        "LiveKit participant connected; resending per-participant E2EE keys"
-                    );
-                    if let Err(err) = send_per_participant_keys(
-                        &room,
-                        context.key_index,
-                        &context.local_key,
-                        target_device_id.as_deref(),
-                    )
-                    .await
-                    {
-                        info!(
-                            ?err,
-                            "failed to resend per-participant E2EE keys on participant connect"
-                        );
-                    }
-                }
-                RoomEvent::TrackPublished { participant, .. }
-                | RoomEvent::TrackSubscribed { participant, .. } => {
-                    let participant_identity = participant.identity();
-                    let target_device_id = participant_identity
-                        .as_str()
-                        .rsplit_once(':')
-                        .map(|(_, device_id)| device_id.to_owned());
-                    info!(
-                        participant_identity = %participant_identity,
-                        key_index = context.key_index,
-                        "LiveKit track event observed; resending per-participant E2EE keys"
-                    );
-                    if let Err(err) = send_per_participant_keys(
-                        &room,
-                        context.key_index,
-                        &context.local_key,
-                        target_device_id.as_deref(),
-                    )
-                    .await
-                    {
-                        info!(?err, "failed to resend per-participant E2EE keys on track event");
-                    }
-                }
-                _ => {}
-            }
-        }
-    });
-}
-
-#[cfg(feature = "e2ee-per-participant")]
-fn per_participant_key_grace_period() -> std::time::Duration {
-    let grace_ms = std::env::var("PER_PARTICIPANT_KEY_GRACE_PERIOD_MS")
-        .ok()
-        .and_then(|value| value.parse::<u64>().ok())
-        .unwrap_or(300);
-    std::time::Duration::from_millis(grace_ms)
 }
 
 #[cfg(not(feature = "e2ee-per-participant"))]
@@ -1125,272 +1000,6 @@ fn ensure_access_token_query(service_url: &str, token: &str) -> anyhow::Result<S
 }
 
 #[cfg(feature = "e2ee-per-participant")]
-async fn build_per_participant_e2ee(
-    room: &matrix_sdk::Room,
-) -> anyhow::Result<Option<PerParticipantE2eeContext>> {
-    use matrix_sdk_rtc_livekit::matrix_keys::{
-        room_olm_machine, OlmMachineKeyMaterialProvider, PerParticipantKeyMaterialProvider,
-    };
-
-    info!(room_id = %room.room_id(), "starting per-participant E2EE context build");
-    let encryption_state =
-        room.latest_encryption_state().await.context("load room encryption state")?;
-    info!(
-        room_id = %room.room_id(),
-        is_encrypted = encryption_state.is_encrypted(),
-        "loaded room encryption state for per-participant E2EE"
-    );
-    if !encryption_state.is_encrypted() {
-        info!(
-            room_id = %room.room_id(),
-            "build_per_participant_e2ee returning None: room is not encrypted"
-        );
-        return Ok(None);
-    }
-    info!(room_id = %room.room_id(), "room encryption enabled; attempting per-participant E2EE setup");
-
-    let force_download = bool_env("PER_PARTICIPANT_FORCE_BACKUP_DOWNLOAD");
-    if force_download {
-        let backups = room.client().encryption().backups();
-        match backups.download_room_keys_for_room(room.room_id()).await {
-            Ok(()) => info!("requested room keys from backup for per-participant E2EE"),
-            Err(err) => info!(?err, "failed to request room keys from backup"),
-        }
-    }
-
-    let olm_machine = match room_olm_machine(room).await {
-        Ok(machine) => machine,
-        Err(err) => {
-            info!(?err, room_id = %room.room_id(), "build_per_participant_e2ee returning None: no olm machine available");
-            return Ok(None);
-        }
-    };
-    let provider = OlmMachineKeyMaterialProvider::new(olm_machine);
-    let retries = retry_attempts_from_env("PER_PARTICIPANT_KEY_RETRIES", 0);
-    let mut attempt = 0usize;
-    loop {
-        let bundle = provider
-            .per_participant_key_bundle(room.room_id())
-            .await
-            .context("build per-participant key bundle")?;
-
-        info!(
-            room_keys = bundle.room_keys.len(),
-            withheld_keys = bundle.withheld.len(),
-            attempt,
-            retries,
-            "per-participant key bundle details"
-        );
-
-        if !bundle.is_empty() || attempt >= retries {
-            break;
-        }
-
-        attempt += 1;
-        if force_download {
-            let backups = room.client().encryption().backups();
-            match backups.download_room_keys_for_room(room.room_id()).await {
-                Ok(()) => info!("requested room keys from backup for per-participant E2EE"),
-                Err(err) => info!(?err, "failed to request room keys from backup"),
-            }
-        }
-        info!(attempt, retries, "per-participant key bundle empty; retrying after delay");
-        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-    }
-    info!("proceeding with per-participant E2EE setup (sender key is freshly generated)");
-    let mut key_provider_options = KeyProviderOptions::default();
-    key_provider_options.ratchet_window_size = 10;
-    key_provider_options.key_ring_size = 256;
-    key_provider_options.key_derivation_function = KeyDerivationFunction::HKDF;
-
-    let key_provider = std::sync::Arc::new(KeyProvider::new(key_provider_options));
-    let local_key = derive_per_participant_key()?;
-    info!(
-        room_id = %room.room_id(),
-        key_index = 0,
-        local_key_len = local_key.len(),
-        "derived local per-participant E2EE key material"
-    );
-    send_per_participant_keys(room, 0, &local_key, None).await?;
-    info!(
-        room_id = %room.room_id(),
-        key_index = 0,
-        "sent initial per-participant E2EE key to devices"
-    );
-
-    let context = PerParticipantE2eeContext { key_provider, key_index: 0, local_key };
-    info!(
-        room_id = %room.room_id(),
-        key_index = context.key_index,
-        local_key_len = context.local_key.len(),
-        "build_per_participant_e2ee returning Some context"
-    );
-
-    Ok(Some(context))
-}
-
-#[cfg(feature = "e2ee-per-participant")]
-fn derive_per_participant_key() -> anyhow::Result<Vec<u8>> {
-    // Element Call / MatrixRTC uses fresh random key material for per-participant media E2EE
-    // and distributes it via `io.element.call.encryption_keys`.
-    //
-    // In Element Call (matrix-js-sdk), the sender key seed is 16 bytes.
-    // Keeping this at 16 bytes is important for interoperability with the LiveKit E2EE ratchet.
-    use rand::rngs::OsRng;
-    use rand::RngCore;
-
-    let mut key = [0u8; 16];
-    OsRng.fill_bytes(&mut key);
-    Ok(key.to_vec())
-}
-
-/*
-#[cfg(feature = "e2ee-per-participant")]
-fn derive_per_participant_key(bundle: &RoomKeyBundle) -> anyhow::Result<Vec<u8>> {
-    let room_keys = canonicalize_bundle_entries(&bundle.room_keys)
-        .context("canonicalize per-participant room keys")?;
-    let withheld =
-        canonicalize_bundle_entries(&bundle.withheld).context("canonicalize withheld keys")?;
-    let bundle_value = serde_json::json!({
-        "room_keys": room_keys,
-        "withheld": withheld,
-    });
-    let canonical: CanonicalJsonValue = bundle_value
-        .try_into()
-        .context("canonicalize per-participant key bundle")?;
-    let canonical_bytes = serde_json::to_vec(&canonical)
-        .context("serialize canonical per-participant key bundle")?;
-    let digest = Sha256::digest(canonical_bytes);
-
-    Ok(digest.to_vec())
-}
-*/
-
-#[cfg(feature = "e2ee-per-participant")]
-fn canonicalize_bundle_entries<T: serde::Serialize>(
-    entries: &[T],
-) -> anyhow::Result<Vec<serde_json::Value>> {
-    let mut canonical_entries = Vec::with_capacity(entries.len());
-
-    for entry in entries {
-        let value = serde_json::to_value(entry).context("serialize bundle entry")?;
-        let canonical: CanonicalJsonValue =
-            value.clone().try_into().context("canonicalize bundle entry")?;
-        let sort_key = serde_json::to_string(&canonical).context("serialize bundle entry")?;
-        canonical_entries.push((sort_key, value));
-    }
-
-    canonical_entries.sort_by(|left, right| left.0.cmp(&right.0));
-
-    Ok(canonical_entries.into_iter().map(|(_, value)| value).collect())
-}
-
-#[cfg(feature = "e2ee-per-participant")]
-async fn send_per_participant_keys(
-    room: &matrix_sdk::Room,
-    key_index: i32,
-    key: &[u8],
-    target_device_id: Option<&str>,
-) -> anyhow::Result<()> {
-    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-    use base64::Engine as _;
-
-    if key.is_empty() {
-        info!(key_index, "per-participant E2EE key payload is empty; skipping send");
-        return Ok(());
-    }
-
-    // Element Call / MatrixRTC typically expects a fixed-size key seed.
-    // Observed Element Call keys decode to ~16 bytes (22 chars base64url-no-pad).
-    let key = if key.len() >= 16 { &key[..16] } else { key };
-
-    let client = room.client();
-    let own_device_id =
-        client.device_id().context("missing device id for per-participant E2EE")?.to_owned();
-    let own_user_id = client.user_id().map(|id| id.to_owned());
-
-    let members = room.members(RoomMemberships::JOIN).await?;
-    let mut recipients = Vec::new();
-
-    for member in members {
-        let user_id = member.user_id();
-        let devices = client.encryption().get_user_devices(user_id).await?;
-        let device_list: Vec<_> = devices.devices().collect();
-
-        //info!(user_id = %user_id, device_count = device_list.len(), "per-participant E2EE device discovery");
-
-        for device in device_list {
-            if let Some(own_user_id) = own_user_id.as_ref() {
-                if device.user_id() == own_user_id && device.device_id() == &own_device_id {
-                    continue;
-                }
-            }
-            if target_device_id.is_none_or(|target| device.device_id().as_str() == target) {
-                recipients.push(device);
-            }
-        }
-    }
-
-    if recipients.is_empty() {
-        info!("no recipient devices for per-participant E2EE to-device");
-        return Ok(());
-    }
-
-    let key_b64 = URL_SAFE_NO_PAD.encode(key);
-    let sent_ts = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64;
-
-    info!(
-        recipients = recipients.len(),
-        key_index,
-        key_len = key.len(),
-        room_id = %room.room_id(),
-        key = key,
-        keyb64 = key_b64,
-        "sending per-participant E2EE keys to devices"
-    );
-
-    let own_user_id = client.user_id().context("missing user id")?;
-    let claimed = own_device_id.as_str();
-    let member_id = format!("{own_user_id}:{claimed}");
-
-    let content_raw = Raw::new(&serde_json::json!({
-        "keys": { "index": key_index, "key": key_b64 },
-        "device_id": claimed,
-        "member": { "claimed_device_id": claimed, "id": member_id },
-        "room_id": room.room_id().to_string(),
-        "session": {
-            "application": "m.call",
-            "call_id": "",
-            "scope": "m.room"
-        },
-        "sent_ts": sent_ts,
-    }))
-    .context("serialize per-participant to-device payload")?
-    .cast_unchecked();
-
-    let failures = client
-        .encryption()
-        .encrypt_and_send_raw_to_device(
-            recipients.iter().collect(),
-            "io.element.call.encryption_keys",
-            content_raw,
-            CollectStrategy::AllDevices,
-        )
-        .await?;
-
-    if failures.is_empty() {
-        info!("sent per-participant E2EE keys to device recipients");
-    } else {
-        info!(failures = failures.len(), "failed to send per-participant E2EE keys");
-    }
-
-    Ok(())
-}
-
-#[cfg(feature = "e2ee-per-participant")]
 fn register_any_to_device_probe_handler(client: &Client) -> EventHandlerDropGuard {
     info!("registering probe handler for all to-device events");
 
@@ -1436,131 +1045,6 @@ fn register_room_message_key_probe_handler(
             }
         },
     );
-
-    client.event_handler_drop_guard(handle)
-}
-
-#[cfg(feature = "e2ee-per-participant")]
-fn register_e2ee_to_device_handler(
-    client: &Client,
-    room_id: OwnedRoomId,
-    key_provider: std::sync::Arc<KeyProvider>,
-) -> EventHandlerDropGuard {
-    info!(%room_id, "registering per-participant E2EE to-device handler");
-
-    let seen_first_event = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let handle = client.add_event_handler(move |raw: Raw<AnyToDeviceEvent>| {
-        let key_provider = std::sync::Arc::clone(&key_provider);
-        let room_id = room_id.clone();
-        let seen_first_event = seen_first_event.clone();
-        async move {
-            if !seen_first_event.swap(true, std::sync::atomic::Ordering::Relaxed) {
-                info!("per-participant E2EE to-device handler observed first to-device event");
-            }
-
-            let Ok(value) = raw.deserialize_as::<serde_json::Value>() else {
-                info!("to-device event ignored: failed to deserialize raw event");
-                return;
-            };
-            let Some(event_type) = value.get("type").and_then(|v| v.as_str()) else {
-                info!("to-device event ignored: missing event type");
-                return;
-            };
-            if event_type != "io.element.call.encryption_keys" {
-                info!(event_type, "to-device event ignored: not an encryption key event");
-                return;
-            }
-
-            let Some(sender) = value.get("sender").and_then(|v| v.as_str()) else {
-                info!("to-device encryption key event ignored: missing sender");
-                return;
-            };
-            let Some(content) = value.get("content").and_then(|v| v.as_object()) else {
-                info!(sender, "to-device encryption key event ignored: missing content object");
-                return;
-            };
-            let Some(content_room_id) = content.get("room_id").and_then(|v| v.as_str()) else {
-                info!(sender, "to-device encryption key event ignored: missing content.room_id");
-                return;
-            };
-            if content_room_id != room_id.as_str() {
-                info!(
-                    sender,
-                    expected_room_id = %room_id,
-                    received_room_id = content_room_id,
-                    "to-device encryption key event ignored: room_id mismatch"
-                );
-                return;
-            }
-            let Some(device_id) = content.get("device_id").and_then(|v| v.as_str()) else {
-                info!(sender, "to-device encryption key event ignored: missing content.device_id");
-                return;
-            };
-            let keys = content.get("keys");
-            let key_entries: Vec<&serde_json::Value> = match keys {
-                Some(value) if value.is_array() => {
-                    value.as_array().map(|values| values.iter().collect()).unwrap_or_default()
-                }
-                Some(value) if value.is_object() => vec![value],
-                _ => {
-                    info!(
-                        sender,
-                        device_id,
-                        "to-device encryption key event ignored: missing/invalid content.keys"
-                    );
-                    return;
-                }
-            };
-
-            if key_entries.is_empty() {
-                info!(
-                    sender,
-                    device_id,
-                    "to-device encryption key event ignored: content.keys had no entries"
-                );
-                return;
-            }
-
-            info!(
-                sender,
-                device_id,
-                key_count = key_entries.len(),
-                "processing per-participant E2EE to-device key event"
-            );
-
-            let identity = ParticipantIdentity(format!("{sender}:{device_id}"));
-            for key_entry in key_entries {
-                let Some(index) = key_entry.get("index").and_then(|v| v.as_i64()) else {
-                    info!(%identity, "to-device key entry ignored: missing numeric index");
-                    continue;
-                };
-                let Some(key_b64) = key_entry.get("key").and_then(|v| v.as_str()) else {
-                    info!(%identity, key_index = index, "to-device key entry ignored: missing string key");
-                    continue;
-                };
-                let key_bytes = STANDARD_NO_PAD
-                    .decode(key_b64)
-                    .or_else(|_| STANDARD.decode(key_b64))
-                    .or_else(|_| URL_SAFE_NO_PAD.decode(key_b64))
-                    .or_else(|_| URL_SAFE.decode(key_b64));
-                let Ok(key_bytes) = key_bytes else {
-                    info!(
-                        %identity,
-                        key_index = index,
-                        "failed to decode per-participant E2EE key payload"
-                    );
-                    continue;
-                };
-                let key_set = key_provider.set_key(&identity, index as i32, key_bytes);
-                info!(
-                    %identity,
-                    key_index = index,
-                    key_set,
-                    "applied per-participant E2EE key from to-device"
-                );
-            }
-        }
-    });
 
     client.event_handler_drop_guard(handle)
 }
@@ -1680,7 +1164,10 @@ where
                     );
                 }
 
-                let key_grace_period = per_participant_key_grace_period();
+                let key_grace_period = per_participant_key_grace_period_from_env(
+                    "PER_PARTICIPANT_KEY_GRACE_PERIOD_MS",
+                    300,
+                );
                 if !key_grace_period.is_zero() {
                     info!(
                         key_grace_period_ms = key_grace_period.as_millis(),
