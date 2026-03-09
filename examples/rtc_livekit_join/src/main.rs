@@ -29,7 +29,7 @@ use matrix_sdk::{
 };
 #[cfg(all(feature = "v4l2", target_os = "linux"))]
 use matrix_sdk_rtc::LiveKitError;
-use matrix_sdk_rtc::{LiveKitConnector, LiveKitResult, livekit_service_url};
+use matrix_sdk_rtc::{LiveKitConnector, LiveKitResult};
 #[cfg(feature = "e2ee-per-participant")]
 use matrix_sdk_rtc_livekit::livekit::id::ParticipantIdentity;
 #[cfg(feature = "e2ee-per-participant")]
@@ -39,9 +39,9 @@ use matrix_sdk_rtc_livekit::per_participant::{
     send_per_participant_keys, spawn_livekit_e2ee_event_resend,
 };
 use matrix_sdk_rtc_livekit::{
-    LiveKitRoomOptionsProvider, LiveKitSdkConnector, LiveKitTokenProvider, Room, RoomOptions,
+    LiveKitConnectionUpdate, LiveKitRoomOptionsProvider, LiveKitSdkConnector, LiveKitTokenProvider,
+    Room, RoomOptions, resolve_connection_details, update_connection as update_livekit_connection,
 };
-use ruma::api::client::account::request_openid_token;
 #[cfg(feature = "experimental-widgets")]
 use ruma::events::call::member::{
     ActiveFocus, ActiveLivekitFocus, Application, CallApplicationContent, CallMemberEventContent,
@@ -55,7 +55,6 @@ use serde_json::Value as JsonValue;
 #[cfg(feature = "experimental-widgets")]
 use tokio::sync::{oneshot, watch};
 use tracing::{info, warn};
-use url::Url;
 #[cfg(feature = "experimental-widgets")]
 use uuid::Uuid;
 
@@ -252,21 +251,20 @@ async fn main() -> anyhow::Result<()> {
     //   bridge logs below will not appear because the Rust SDK is not connected to that
     //   webview's postMessage channel.
 
-    let (service_url, livekit_token) = if let Some(sfu_url) = livekit_sfu_get_url {
-        let openid_token = request_openid_token(&client).await.context("request OpenID token")?;
-        let device_id =
-            client.device_id().context("missing device id for /sfu/get request")?.to_string();
-        fetch_sfu_token(&sfu_url, room.room_id().to_owned(), device_id, &openid_token)
-            .await
-            .context("fetch LiveKit token from /sfu/get")?
-    } else {
-        let token = required_env("LIVEKIT_TOKEN")?;
-        let service_url = match livekit_service_url_override {
-            Some(url) => url,
-            None => livekit_service_url(&client).await.context("fetch LiveKit service url")?,
-        };
-        (service_url, token)
-    };
+    let static_livekit_token = optional_env("LIVEKIT_TOKEN");
+    let connection_details = resolve_connection_details(
+        &client,
+        &room,
+        livekit_sfu_get_url.as_deref(),
+        livekit_service_url_override.as_deref(),
+        static_livekit_token.as_deref(),
+    )
+    .await
+    .context("resolve LiveKit connection details")?;
+    let livekit_token = connection_details.token.clone();
+    let service_url = connection_details
+        .authenticated_service_url()
+        .context("attach access_token to LiveKit service url")?;
 
     #[cfg(feature = "experimental-widgets")]
     if let Some(widget) = widget.as_ref() {
@@ -329,9 +327,6 @@ async fn main() -> anyhow::Result<()> {
         "configured LiveKit room options provider"
     );
     let connector = LiveKitSdkConnector::new(token_provider, room_options_provider);
-
-    let service_url = ensure_access_token_query(&service_url, &livekit_token)
-        .context("attach access_token to LiveKit service url")?;
 
     #[cfg(feature = "experimental-widgets")]
     let shutdown_membership_state_key = if widget.is_some() {
@@ -927,78 +922,6 @@ fn via_servers_from_env() -> anyhow::Result<Vec<OwnedServerName>> {
         .collect()
 }
 
-async fn request_openid_token(
-    client: &Client,
-) -> anyhow::Result<request_openid_token::v3::Response> {
-    let user_id = client.user_id().context("missing user id for OpenID token request")?;
-    let request = request_openid_token::v3::Request::new(user_id.to_owned());
-    let response = client.send(request).await?;
-    Ok(response)
-}
-
-#[derive(serde::Serialize)]
-struct SfuGetRequest {
-    room: String,
-    openid_token: OpenIdToken,
-    device_id: String,
-}
-
-#[derive(serde::Serialize)]
-struct OpenIdToken {
-    access_token: String,
-    expires_in: u64,
-    matrix_server_name: String,
-    token_type: String,
-}
-
-async fn fetch_sfu_token(
-    url: &str,
-    room_id: OwnedRoomId,
-    device_id: String,
-    openid_token: &request_openid_token::v3::Response,
-) -> anyhow::Result<(String, String)> {
-    let request_body = SfuGetRequest {
-        room: room_id.to_string(),
-        openid_token: OpenIdToken {
-            access_token: openid_token.access_token.clone(),
-            expires_in: openid_token.expires_in.as_secs(),
-            matrix_server_name: openid_token.matrix_server_name.to_string(),
-            token_type: openid_token.token_type.to_string(),
-        },
-        device_id,
-    };
-    let client = reqwest::Client::new();
-    let request = client.post(url).json(&request_body);
-
-    let response = request.send().await?.error_for_status()?;
-    let payload: JsonValue = response.json().await?;
-
-    let service_url = extract_string(
-        &payload,
-        &["service_url", "livekit_service_url", "livekit_url", "sfu_base_url", "sfu_url", "url"],
-    )
-    .context("missing LiveKit service url in /sfu/get response")?;
-    let token = extract_string(&payload, &["token", "jwt", "access_token"])
-        .context("missing LiveKit token in /sfu/get response")?;
-
-    Ok((service_url, token))
-}
-
-fn extract_string(payload: &JsonValue, keys: &[&str]) -> Option<String> {
-    keys.iter().find_map(|key| {
-        payload.get(*key).and_then(|value| value.as_str()).map(|value| value.to_owned())
-    })
-}
-
-fn ensure_access_token_query(service_url: &str, token: &str) -> anyhow::Result<String> {
-    let mut url = Url::parse(service_url)?;
-    let has_access_token = url.query_pairs().any(|(key, _)| key == "access_token");
-    if !has_access_token {
-        url.query_pairs_mut().append_pair("access_token", token);
-    }
-    Ok(url.into())
-}
-
 #[cfg(feature = "e2ee-per-participant")]
 fn register_any_to_device_probe_handler(client: &Client) -> EventHandlerDropGuard {
     info!("registering probe handler for all to-device events");
@@ -1064,12 +987,16 @@ where
     #[cfg(all(feature = "v4l2", target_os = "linux"))]
     let mut v4l2_publisher: Option<V4l2CameraPublisher> = None;
 
-    update_connection(
+    handle_connection_update(
+        update_livekit_connection(
+            &room,
+            &connector,
+            &service_url,
+            &room.clone_info(),
+            &mut connection,
+        )
+        .await?,
         &room,
-        &connector,
-        &service_url,
-        &room.clone_info(),
-        &mut connection,
         &v4l2_config,
         #[cfg(all(feature = "v4l2", target_os = "linux"))]
         &mut v4l2_publisher,
@@ -1079,12 +1006,10 @@ where
     .await?;
 
     while let Some(room_info) = info_stream.next().await {
-        update_connection(
+        handle_connection_update(
+            update_livekit_connection(&room, &connector, &service_url, &room_info, &mut connection)
+                .await?,
             &room,
-            &connector,
-            &service_url,
-            &room_info,
-            &mut connection,
             &v4l2_config,
             #[cfg(all(feature = "v4l2", target_os = "linux"))]
             &mut v4l2_publisher,
@@ -1104,40 +1029,23 @@ where
     Ok(())
 }
 
-async fn update_connection<O>(
+async fn handle_connection_update(
+    update: LiveKitConnectionUpdate,
     room: &matrix_sdk::Room,
-    connector: &LiveKitSdkConnector<EnvLiveKitTokenProvider, O>,
-    service_url: &str,
-    room_info: &matrix_sdk::RoomInfo,
-    connection: &mut Option<std::sync::Arc<Room>>,
     v4l2_config: &impl V4l2ConfigOption,
     #[cfg(all(feature = "v4l2", target_os = "linux"))] v4l2_publisher: &mut Option<
         V4l2CameraPublisher,
     >,
     #[cfg(feature = "e2ee-per-participant")] e2ee_context: &Option<PerParticipantE2eeContext>,
-) -> LiveKitResult<()>
-where
-    O: LiveKitRoomOptionsProvider,
-{
-    let has_memberships = room_info.has_active_room_call();
-    info!(
-        room_id = ?room.room_id(),
-        has_memberships,
-        participants = room_info.active_room_call_participants().len(),
-        "observed call membership state"
-    );
-
-    if has_memberships {
-        if connection.is_none() {
-            info!(room_id = ?room.room_id(), "joining LiveKit room for active call");
-            let new_connection = connector.connect(service_url, room).await?;
-            #[cfg(feature = "e2ee-per-participant")]
-            let livekit_events = new_connection.take_events().await;
-            let room_handle = std::sync::Arc::new(new_connection.into_room());
+) -> LiveKitResult<()> {
+    match update {
+        LiveKitConnectionUpdate::Joined { room: room_handle, events } => {
             info!(
                 room_name = %room_handle.name(),
                 "LiveKit room connected"
             );
+            #[cfg(feature = "e2ee-per-participant")]
+            let livekit_events = events;
             #[cfg(feature = "e2ee-per-participant")]
             if let Some(context) = e2ee_context.as_ref() {
                 let identity = room_handle.local_participant().identity();
@@ -1191,14 +1099,18 @@ where
                     *v4l2_publisher = Some(publisher);
                 }
             }
-            *connection = Some(room_handle);
         }
-    } else if connection.take().is_some() {
-        info!(room_id = ?room.room_id(), "leaving LiveKit room because the call ended");
-        #[cfg(all(feature = "v4l2", target_os = "linux"))]
-        if let Some(publisher) = v4l2_publisher.take() {
-            publisher.stop().await.map_err(|err| LiveKitError::connector(V4l2PublishError(err)))?;
+        LiveKitConnectionUpdate::Left =>
+        {
+            #[cfg(all(feature = "v4l2", target_os = "linux"))]
+            if let Some(publisher) = v4l2_publisher.take() {
+                publisher
+                    .stop()
+                    .await
+                    .map_err(|err| LiveKitError::connector(V4l2PublishError(err)))?;
+            }
         }
+        LiveKitConnectionUpdate::Unchanged => {}
     }
 
     Ok(())

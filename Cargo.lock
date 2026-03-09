@@ -4454,13 +4454,20 @@ name = "matrix-sdk-rtc-livekit"
 version = "0.16.0"
 dependencies = [
  "async-trait",
+ "base64 0.22.1",
  "livekit",
  "matrix-sdk",
+ "matrix-sdk-base",
  "matrix-sdk-crypto",
  "matrix-sdk-rtc",
+ "rand 0.8.5",
+ "reqwest",
+ "ruma",
+ "serde_json",
  "thiserror 2.0.17",
  "tokio",
  "tracing",
+ "url",
 ]
 
 [[package]]
