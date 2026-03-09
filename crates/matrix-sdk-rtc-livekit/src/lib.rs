@@ -262,7 +262,7 @@ pub async fn update_connection<T, O>(
     connector: &LiveKitSdkConnector<T, O>,
     service_url: &str,
     room_info: &matrix_sdk::RoomInfo,
-    connection: &mut Option<std::sync::Arc<Room>>,
+    connection: &mut Option<Arc<Room>>,
 ) -> LiveKitResult<LiveKitConnectionUpdate>
 where
     T: LiveKitTokenProvider,
@@ -275,7 +275,7 @@ where
             info!(room_id = ?room.room_id(), "joining LiveKit room for active call");
             let new_connection = connector.connect(service_url, room).await?;
             let livekit_events = new_connection.take_events().await;
-            let room_handle = std::sync::Arc::new(new_connection.into_room());
+            let room_handle = Arc::new(new_connection.into_room());
             *connection = Some(Arc::clone(&room_handle));
             return Ok(LiveKitConnectionUpdate::Joined {
                 room: room_handle,
@@ -300,7 +300,7 @@ where
     T: LiveKitTokenProvider,
     O: LiveKitRoomOptionsProvider,
 {
-    let mut connection: Option<std::sync::Arc<Room>> = None;
+    let mut connection: Option<Arc<Room>> = None;
     let mut info_stream = room.subscribe_info();
 
     let _ = update_connection(&room, connector, service_url, &room.clone_info(), &mut connection)
@@ -330,10 +330,7 @@ where
         room: &MatrixRoom,
     ) -> LiveKitResult<Self::Connection> {
         let token = self.token_provider.token(room).await?;
-        let mut room_options = self.room_options_provider().room_options();
-        if room_options.encryption.is_none() {
-            room_options.encryption = room_options.e2ee.clone();
-        }
+        let room_options = self.room_options_provider().room_options();
 
         if let Some(encryption) = room_options.encryption.as_ref() {
             let key_provider = &encryption.key_provider;
