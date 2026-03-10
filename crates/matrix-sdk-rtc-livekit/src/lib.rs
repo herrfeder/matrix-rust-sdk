@@ -330,7 +330,11 @@ where
         room: &MatrixRoom,
     ) -> LiveKitResult<Self::Connection> {
         let token = self.token_provider.token(room).await?;
-        let room_options = self.room_options_provider().room_options();
+        let mut room_options = self.room_options_provider().room_options();
+        #[allow(deprecated)]
+        if room_options.encryption.is_none() {
+            room_options.encryption = room_options.e2ee.clone();
+        }
 
         if let Some(encryption) = room_options.encryption.as_ref() {
             let key_provider = &encryption.key_provider;
