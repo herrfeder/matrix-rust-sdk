@@ -14,6 +14,12 @@
 
 //! Element Call specific widget helpers.
 
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex},
+    time::{SystemTime, UNIX_EPOCH},
+};
+
 use ruma::{
     events::call::member::{
         ActiveFocus, ActiveLivekitFocus, Application, CallApplicationContent,
@@ -24,8 +30,234 @@ use ruma::{
 };
 use serde::Serialize;
 use serde_json::{json, Value as JsonValue};
+use tokio::sync::{oneshot, watch};
+use tracing::info;
 
-use super::{Capabilities, Filter, MessageLikeEventFilter, StateEventFilter, ToDeviceEventFilter};
+use super::{
+    Capabilities, ClientProperties, EncryptionSystem, Filter, Intent, MessageLikeEventFilter,
+    StateEventFilter, StaticCapabilitiesProvider, ToDeviceEventFilter,
+    VirtualElementCallWidgetConfig, VirtualElementCallWidgetProperties, WidgetDriver,
+    WidgetDriverHandle, WidgetSettings,
+};
+use crate::{room::Room, Error, Result};
+
+/// Runtime handle and state for a started Element Call widget.
+#[derive(Clone, Debug)]
+pub struct ElementCallWidget {
+    handle: WidgetDriverHandle,
+    widget_id: String,
+    capabilities_ready: watch::Receiver<bool>,
+    pending_widget_responses: Arc<Mutex<HashMap<String, oneshot::Sender<JsonValue>>>>,
+}
+
+impl ElementCallWidget {
+    /// Access the driver handle used to send/receive widget messages.
+    pub fn handle(&self) -> &WidgetDriverHandle {
+        &self.handle
+    }
+
+    /// The widget id used by this widget instance.
+    pub fn widget_id(&self) -> &str {
+        &self.widget_id
+    }
+
+    /// A watch channel that flips to `true` after capability negotiation.
+    pub fn capabilities_ready(&self) -> watch::Receiver<bool> {
+        self.capabilities_ready.clone()
+    }
+
+    /// Track a request id and return a receiver for the corresponding widget response.
+    pub fn track_pending_response(&self, request_id: String) -> oneshot::Receiver<JsonValue> {
+        let (tx, rx) = oneshot::channel();
+        if let Ok(mut pending) = self.pending_widget_responses.lock() {
+            pending.insert(request_id, tx);
+        }
+        rx
+    }
+
+    /// Stop tracking a request id.
+    pub fn remove_pending_response(&self, request_id: &str) {
+        if let Ok(mut pending) = self.pending_widget_responses.lock() {
+            pending.remove(request_id);
+        }
+    }
+}
+
+/// Additional options used to initialize a virtual Element Call widget.
+#[derive(Debug)]
+pub struct ElementCallWidgetOptions {
+    /// The widget id used in widget-api messages.
+    pub widget_id: String,
+    /// The parent URL used as postMessage target.
+    pub parent_url: Option<String>,
+    /// Encryption mode for Element Call.
+    pub encryption: EncryptionSystem,
+    /// Join/start intent for Element Call.
+    pub intent: Intent,
+    /// Client properties used for URL generation.
+    pub client_properties: ClientProperties,
+}
+
+impl Default for ElementCallWidgetOptions {
+    fn default() -> Self {
+        Self {
+            widget_id: "element-call".to_owned(),
+            parent_url: None,
+            encryption: EncryptionSystem::PerParticipantKeys,
+            intent: Intent::JoinExisting,
+            client_properties: ClientProperties::new("matrix-rust-sdk", None, None),
+        }
+    }
+}
+
+/// Start a virtual Element Call widget backed by a [`WidgetDriver`].
+pub async fn start_element_call_widget(
+    room: Room,
+    element_call_url: String,
+    options: ElementCallWidgetOptions,
+) -> Result<ElementCallWidget> {
+    let own_user_id = room
+        .client()
+        .user_id()
+        .ok_or_else(|| {
+            Error::UnknownError(
+                std::io::Error::other("missing user id for element call widget").into(),
+            )
+        })?
+        .to_owned();
+    let own_device_id = room
+        .client()
+        .device_id()
+        .ok_or_else(|| {
+            Error::UnknownError(
+                std::io::Error::other("missing device id for element call widget").into(),
+            )
+        })?
+        .to_owned();
+
+    let props = VirtualElementCallWidgetProperties {
+        element_call_url,
+        widget_id: options.widget_id,
+        parent_url: options.parent_url,
+        encryption: options.encryption,
+        ..Default::default()
+    };
+    let config =
+        VirtualElementCallWidgetConfig { intent: Some(options.intent), ..Default::default() };
+
+    let widget_settings = WidgetSettings::new_virtual_element_call_widget(props, config)?;
+    let widget_id = widget_settings.widget_id().to_owned();
+    let widget_url = widget_settings.generate_webview_url(&room, options.client_properties).await?;
+    info!(%widget_url, "element call widget url");
+    info!(widget_id = %widget_settings.widget_id(), "starting Element Call widget driver");
+
+    let (driver, handle) = WidgetDriver::new(widget_settings);
+    let capabilities = element_call_capabilities(&own_user_id, &own_device_id);
+    let capabilities_provider = StaticCapabilitiesProvider::new(capabilities);
+    let widget_capabilities = capabilities_provider.capabilities().clone();
+    let (capabilities_ready_tx, capabilities_ready_rx) = watch::channel(false);
+    let pending_widget_responses: Arc<Mutex<HashMap<String, oneshot::Sender<JsonValue>>>> =
+        Arc::new(Mutex::new(HashMap::new()));
+    tokio::spawn(async move {
+        if driver.run(room, capabilities_provider).await.is_err() {
+            info!("element call widget driver stopped");
+        }
+    });
+
+    let outbound_handle = handle.clone();
+    let outbound_widget_id = widget_id.clone();
+    let pending_widget_responses_for_task = pending_widget_responses.clone();
+    tokio::spawn(async move {
+        let capabilities_ready_tx = capabilities_ready_tx;
+        let pending_widget_responses = pending_widget_responses_for_task;
+        while let Some(message) = outbound_handle.recv().await {
+            let Ok(value) = serde_json::from_str::<serde_json::Value>(&message) else {
+                continue;
+            };
+            let Some(request_id) = value.get("requestId").and_then(|v| v.as_str()) else {
+                continue;
+            };
+            if value.get("response").is_some() {
+                if let Some(tx) = pending_widget_responses
+                    .lock()
+                    .ok()
+                    .and_then(|mut pending| pending.remove(request_id))
+                {
+                    let _ = tx.send(value);
+                }
+                continue;
+            }
+            let Some(action) = value.get("action").and_then(|v| v.as_str()) else {
+                continue;
+            };
+            let api = value.get("api").and_then(|v| v.as_str());
+            if api != Some("toWidget") {
+                continue;
+            }
+            if action == "capabilities" {
+                let response = serde_json::json!({
+                    "api": "toWidget",
+                    "widgetId": outbound_widget_id,
+                    "requestId": request_id,
+                    "action": "capabilities",
+                    "data": {},
+                    "response": {
+                        "capabilities": widget_capabilities,
+                    },
+                });
+                if !outbound_handle.send(response.to_string()).await {
+                    break;
+                }
+            }
+            if action == "notify_capabilities" {
+                let response = serde_json::json!({
+                    "api": "toWidget",
+                    "widgetId": outbound_widget_id,
+                    "requestId": request_id,
+                    "action": "notify_capabilities",
+                    "data": {},
+                    "response": {},
+                });
+                if !outbound_handle.send(response.to_string()).await {
+                    break;
+                }
+                let _ = capabilities_ready_tx.send(true);
+            }
+            if action == "send_to_device" {
+                let data = value.get("data").cloned().unwrap_or_else(|| serde_json::json!({}));
+                let event_type = data
+                    .get("event_type")
+                    .and_then(|v| v.as_str())
+                    .or_else(|| data.get("type").and_then(|v| v.as_str()));
+                if event_type == Some("io.element.call.encryption_keys") {
+                    info!(request_id, payload = %data, "widget send_to_device encryption key payload");
+                } else {
+                    info!(request_id, event_type, "widget send_to_device received");
+                }
+            }
+        }
+        info!("widget -> rust-sdk message stream closed");
+    });
+
+    let content_loaded = serde_json::json!({
+        "api": "fromWidget",
+        "widgetId": widget_id,
+        "requestId": format!(
+            "content-loaded-{}",
+            SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis()
+        ),
+        "action": "content_loaded",
+        "data": {},
+    });
+    let _ = handle.send(content_loaded.to_string()).await;
+
+    Ok(ElementCallWidget {
+        handle,
+        widget_id,
+        capabilities_ready: capabilities_ready_rx,
+        pending_widget_responses,
+    })
+}
 
 /// Build the default Element Call capability set used by SDK-driven widgets.
 pub fn element_call_capabilities(own_user_id: &UserId, own_device_id: &DeviceId) -> Capabilities {
