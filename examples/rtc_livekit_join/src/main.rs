@@ -1,30 +1,26 @@
 #![recursion_limit = "256"]
 
-#[cfg(feature = "experimental-widgets")]
-use std::collections::HashMap;
 #[cfg(any(feature = "experimental-widgets", all(feature = "v4l2", target_os = "linux")))]
 use std::sync::{Arc, Mutex};
 use std::{env, fs};
 
-use anyhow::{Context, anyhow};
+use anyhow::{anyhow, Context};
 #[cfg(any(feature = "e2ee-per-participant", feature = "e2e-encryption"))]
 use futures_util::StreamExt;
 #[cfg(feature = "e2e-encryption")]
 use matrix_sdk::encryption::secret_storage::SecretStore;
 use matrix_sdk::{
-    Client, RoomState,
     config::SyncSettings,
     event_handler::EventHandlerDropGuard,
     ruma::{OwnedRoomId, OwnedServerName, RoomId, RoomOrAliasId, ServerName},
+    Client, RoomState,
 };
 #[cfg(feature = "experimental-widgets")]
 use matrix_sdk::{
     ruma::{DeviceId, UserId},
     widget::{
-        Capabilities, CapabilitiesProvider, ClientProperties, EncryptionSystem, Filter, Intent,
-        MessageLikeEventFilter, StateEventFilter, ToDeviceEventFilter,
-        VirtualElementCallWidgetConfig, VirtualElementCallWidgetProperties, WidgetDriver,
-        WidgetSettings,
+        element_call_member_content, element_call_send_event_message, start_element_call_widget,
+        ClientProperties, ElementCallWidget, ElementCallWidgetOptions, EncryptionSystem, Intent,
     },
 };
 #[cfg(all(feature = "v4l2", target_os = "linux"))]
@@ -34,26 +30,21 @@ use matrix_sdk_rtc::{LiveKitConnector, LiveKitResult};
 use matrix_sdk_rtc_livekit::livekit::id::ParticipantIdentity;
 #[cfg(feature = "e2ee-per-participant")]
 use matrix_sdk_rtc_livekit::per_participant::{
-    E2eeRoomOptionsProvider, PerParticipantE2eeContext, build_per_participant_e2ee,
-    per_participant_key_grace_period_from_env, register_e2ee_to_device_handler,
-    send_per_participant_keys, spawn_livekit_e2ee_event_resend,
+    build_per_participant_e2ee, per_participant_key_grace_period_from_env,
+    register_e2ee_to_device_handler, send_per_participant_keys, spawn_livekit_e2ee_event_resend,
+    E2eeRoomOptionsProvider, PerParticipantE2eeContext,
 };
 use matrix_sdk_rtc_livekit::{
+    resolve_connection_details, update_connection as update_livekit_connection,
     LiveKitConnectionUpdate, LiveKitRoomOptionsProvider, LiveKitSdkConnector, LiveKitTokenProvider,
-    Room, RoomOptions, resolve_connection_details, update_connection as update_livekit_connection,
+    Room, RoomOptions,
 };
 #[cfg(feature = "experimental-widgets")]
-use ruma::events::call::member::{
-    ActiveFocus, ActiveLivekitFocus, Application, CallApplicationContent, CallMemberEventContent,
-    CallMemberStateKey, CallScope, Focus, LivekitFocus,
-};
+use ruma::events::call::member::CallMemberStateKey;
 #[cfg(feature = "e2ee-per-participant")]
 use ruma::events::{AnySyncMessageLikeEvent, AnyToDeviceEvent};
 #[cfg(feature = "e2ee-per-participant")]
 use ruma::serde::Raw;
-use serde_json::Value as JsonValue;
-#[cfg(feature = "experimental-widgets")]
-use tokio::sync::{oneshot, watch};
 use tracing::{info, warn};
 #[cfg(feature = "experimental-widgets")]
 use uuid::Uuid;
@@ -66,31 +57,6 @@ struct EnvLiveKitTokenProvider {
 }
 
 struct DefaultRoomOptionsProvider;
-
-#[cfg(feature = "experimental-widgets")]
-#[derive(Clone)]
-struct StaticCapabilitiesProvider {
-    capabilities: Capabilities,
-}
-
-#[cfg(feature = "experimental-widgets")]
-#[derive(Clone)]
-struct ElementCallWidget {
-    handle: matrix_sdk::widget::WidgetDriverHandle,
-    widget_id: String,
-    capabilities_ready: watch::Receiver<bool>,
-    pending_widget_responses: Arc<Mutex<HashMap<String, oneshot::Sender<JsonValue>>>>,
-}
-
-#[cfg(not(feature = "experimental-widgets"))]
-struct ElementCallWidget;
-
-#[cfg(feature = "experimental-widgets")]
-impl CapabilitiesProvider for StaticCapabilitiesProvider {
-    async fn acquire_capabilities(&self, _capabilities: Capabilities) -> Capabilities {
-        self.capabilities.clone()
-    }
-}
 
 #[async_trait::async_trait]
 impl LiveKitTokenProvider for EnvLiveKitTokenProvider {
@@ -108,7 +74,7 @@ impl LiveKitRoomOptionsProvider for DefaultRoomOptionsProvider {
 #[cfg(all(feature = "v4l2", target_os = "linux"))]
 mod videosource;
 #[cfg(all(feature = "v4l2", target_os = "linux"))]
-use videosource::{V4l2CameraPublisher, V4l2Config, V4l2PublishError, v4l2_config_from_env};
+use videosource::{v4l2_config_from_env, V4l2CameraPublisher, V4l2Config, V4l2PublishError};
 
 #[cfg(not(all(feature = "v4l2", target_os = "linux")))]
 fn v4l2_config_from_env() -> anyhow::Result<()> {
@@ -212,11 +178,44 @@ async fn main() -> anyhow::Result<()> {
     spawn_backup_diagnostics(client.clone(), room.room_id().to_owned());
     let element_call_url =
         optional_env("ELEMENT_CALL_URL").or_else(|| optional_env("ELEMENT_CALL_WIDGET"));
+    #[cfg(feature = "experimental-widgets")]
     let widget = if let Some(element_call_url) = element_call_url {
         info!(%element_call_url, "Element Call widget URL set; starting widget bridge");
-        start_element_call_widget(room.clone(), element_call_url)
+
+        let encryption_state = room
+            .latest_encryption_state()
             .await
-            .context("start element call widget")?
+            .context("load room encryption state for element call")?;
+        let encryption = if encryption_state.is_encrypted() {
+            info!("room is encrypted; Element Call will be configured for E2EE");
+            #[cfg(feature = "e2ee-per-participant")]
+            {
+                EncryptionSystem::PerParticipantKeys
+            }
+            #[cfg(not(feature = "e2ee-per-participant"))]
+            {
+                info!("room is encrypted but per-participant E2EE is disabled at compile time");
+                EncryptionSystem::Unencrypted
+            }
+        } else {
+            info!("room is not encrypted; Element Call will be configured unencrypted");
+            EncryptionSystem::Unencrypted
+        };
+
+        let options = ElementCallWidgetOptions {
+            widget_id: optional_env("ELEMENT_CALL_WIDGET_ID")
+                .unwrap_or_else(|| "element-call".to_owned()),
+            parent_url: optional_env("ELEMENT_CALL_PARENT_URL"),
+            encryption,
+            intent: Intent::JoinExisting,
+            client_properties: ClientProperties::new("matrix-sdk-rtc-livekit-join", None, None),
+        };
+
+        Some(
+            start_element_call_widget(room.clone(), element_call_url, options)
+                .await
+                .context("start element call widget")?,
+        )
     } else if optional_env("ELEMENT_CALL_WIDGET_ID").is_some() {
         info!("ELEMENT_CALL_WIDGET_ID set but no Element Call URL provided");
         None
@@ -225,7 +224,7 @@ async fn main() -> anyhow::Result<()> {
     };
 
     #[cfg(not(feature = "experimental-widgets"))]
-    let _ = &widget;
+    let widget: Option<()> = None;
 
     #[cfg(feature = "e2ee-per-participant")]
     let _to_device_probe_guard = register_any_to_device_probe_handler(&client);
@@ -496,276 +495,13 @@ fn spawn_periodic_e2ee_key_resend(room: matrix_sdk::Room, context: PerParticipan
 fn spawn_periodic_e2ee_key_resend(_room: matrix_sdk::Room, _context: ()) {}
 
 #[cfg(feature = "experimental-widgets")]
-fn element_call_capabilities(own_user_id: &UserId, own_device_id: &DeviceId) -> Capabilities {
-    use ruma::events::{MessageLikeEventType, StateEventType};
-
-    let read_send = vec![
-        Filter::MessageLike(MessageLikeEventFilter::WithType(MessageLikeEventType::from(
-            "org.matrix.rageshake_request",
-        ))),
-        Filter::ToDevice(ToDeviceEventFilter::new("io.element.call.encryption_keys".into())),
-        Filter::MessageLike(MessageLikeEventFilter::WithType(MessageLikeEventType::from(
-            "io.element.call.encryption_keys",
-        ))),
-        Filter::MessageLike(MessageLikeEventFilter::WithType(MessageLikeEventType::from(
-            "io.element.call.reaction",
-        ))),
-        Filter::MessageLike(MessageLikeEventFilter::WithType(MessageLikeEventType::Reaction)),
-        Filter::MessageLike(MessageLikeEventFilter::WithType(MessageLikeEventType::RoomRedaction)),
-        Filter::MessageLike(MessageLikeEventFilter::WithType(MessageLikeEventType::RtcDecline)),
-    ];
-
-    let user_id = own_user_id.as_str();
-    let device_id = own_device_id.as_str();
-    let membership_state_key = CallMemberStateKey::new(
-        own_user_id.to_owned(),
-        Some(format!("{own_device_id}_m.call")),
-        false,
-    )
-    .as_ref()
-    .to_owned();
-
-    Capabilities {
-        read: vec![
-            Filter::State(StateEventFilter::WithType(StateEventType::CallMember)),
-            Filter::State(StateEventFilter::WithType(StateEventType::RoomName)),
-            Filter::State(StateEventFilter::WithType(StateEventType::RoomMember)),
-            Filter::State(StateEventFilter::WithType(StateEventType::RoomEncryption)),
-            Filter::State(StateEventFilter::WithType(StateEventType::RoomCreate)),
-        ]
-        .into_iter()
-        .chain(read_send.clone())
-        .collect(),
-        send: vec![
-            Filter::MessageLike(MessageLikeEventFilter::WithType(
-                MessageLikeEventType::RtcNotification,
-            )),
-            Filter::MessageLike(MessageLikeEventFilter::WithType(MessageLikeEventType::CallNotify)),
-            Filter::State(StateEventFilter::WithTypeAndStateKey(
-                StateEventType::CallMember,
-                user_id.to_owned(),
-            )),
-            Filter::State(StateEventFilter::WithTypeAndStateKey(
-                StateEventType::CallMember,
-                format!("{user_id}_{device_id}"),
-            )),
-            Filter::State(StateEventFilter::WithTypeAndStateKey(
-                StateEventType::CallMember,
-                membership_state_key,
-            )),
-            Filter::State(StateEventFilter::WithTypeAndStateKey(
-                StateEventType::CallMember,
-                format!("{user_id}_{device_id}_m.call"),
-            )),
-            Filter::State(StateEventFilter::WithTypeAndStateKey(
-                StateEventType::CallMember,
-                format!("_{user_id}_{device_id}"),
-            )),
-            Filter::State(StateEventFilter::WithTypeAndStateKey(
-                StateEventType::CallMember,
-                format!("_{user_id}_{device_id}_m.call"),
-            )),
-        ]
-        .into_iter()
-        .chain(read_send)
-        .collect(),
-        requires_client: true,
-        update_delayed_event: true,
-        send_delayed_event: true,
-    }
-}
-
-#[cfg(feature = "experimental-widgets")]
-async fn start_element_call_widget(
-    room: matrix_sdk::Room,
-    element_call_url: String,
-) -> anyhow::Result<Option<ElementCallWidget>> {
-    let own_user_id =
-        room.client().user_id().context("missing user id for element call widget")?.to_owned();
-    let own_device_id =
-        room.client().device_id().context("missing device id for element call widget")?.to_owned();
-
-    let encryption_state = room
-        .latest_encryption_state()
-        .await
-        .context("load room encryption state for element call")?;
-    let encryption = if encryption_state.is_encrypted() {
-        info!("room is encrypted; Element Call will be configured for E2EE");
-        #[cfg(feature = "e2ee-per-participant")]
-        {
-            EncryptionSystem::PerParticipantKeys
-        }
-        #[cfg(not(feature = "e2ee-per-participant"))]
-        {
-            info!("room is encrypted but per-participant E2EE is disabled at compile time");
-            EncryptionSystem::Unencrypted
-        }
-    } else {
-        info!("room is not encrypted; Element Call will be configured unencrypted");
-        EncryptionSystem::Unencrypted
-    };
-
-    let widget_id =
-        optional_env("ELEMENT_CALL_WIDGET_ID").unwrap_or_else(|| "element-call".to_owned());
-    let props = VirtualElementCallWidgetProperties {
-        element_call_url,
-        widget_id,
-        parent_url: optional_env("ELEMENT_CALL_PARENT_URL"),
-        encryption,
-        ..Default::default()
-    };
-    let config =
-        VirtualElementCallWidgetConfig { intent: Some(Intent::JoinExisting), ..Default::default() };
-
-    let widget_settings = WidgetSettings::new_virtual_element_call_widget(props, config)
-        .context("build element call widget settings")?;
-    let widget_id = widget_settings.widget_id().to_owned();
-    let widget_url = widget_settings
-        .generate_webview_url(
-            &room,
-            ClientProperties::new("matrix-sdk-rtc-livekit-join", None, None),
-        )
-        .await
-        .context("generate element call widget url")?;
-    info!(%widget_url, "element call widget url");
-    info!(
-        widget_id = %widget_settings.widget_id(),
-        "starting Element Call widget driver"
-    );
-
-    let (driver, handle) = WidgetDriver::new(widget_settings);
-    let capabilities = element_call_capabilities(&own_user_id, &own_device_id);
-    let capabilities_provider = StaticCapabilitiesProvider { capabilities };
-    let widget_capabilities = capabilities_provider.capabilities.clone();
-    let (capabilities_ready_tx, capabilities_ready_rx) = watch::channel(false);
-    let pending_widget_responses: Arc<Mutex<HashMap<String, oneshot::Sender<JsonValue>>>> =
-        Arc::new(Mutex::new(HashMap::new()));
-    tokio::spawn(async move {
-        if driver.run(room, capabilities_provider).await.is_err() {
-            info!("element call widget driver stopped");
-        }
-    });
-
-    let outbound_handle = handle.clone();
-    let outbound_widget_id = widget_id.clone();
-    let pending_widget_responses_for_task = pending_widget_responses.clone();
-    tokio::spawn(async move {
-        let capabilities_ready_tx = capabilities_ready_tx;
-        let pending_widget_responses = pending_widget_responses_for_task;
-        while let Some(message) = outbound_handle.recv().await {
-            info!("widget -> rust-sdk message forwarded to stdout");
-            println!("{message}");
-            let Ok(value) = serde_json::from_str::<serde_json::Value>(&message) else {
-                continue;
-            };
-            let Some(request_id) = value.get("requestId").and_then(|v| v.as_str()) else {
-                continue;
-            };
-            if value.get("response").is_some() {
-                if let Some(tx) = pending_widget_responses
-                    .lock()
-                    .ok()
-                    .and_then(|mut pending| pending.remove(request_id))
-                {
-                    let _ = tx.send(value);
-                }
-                continue;
-            }
-            let Some(action) = value.get("action").and_then(|v| v.as_str()) else {
-                continue;
-            };
-            let api = value.get("api").and_then(|v| v.as_str());
-            if api != Some("toWidget") {
-                continue;
-            }
-            if action == "capabilities" {
-                info!(request_id, "widget requested capabilities");
-                let response = serde_json::json!({
-                    "api": "toWidget",
-                    "widgetId": outbound_widget_id,
-                    "requestId": request_id.clone(),
-                    "action": "capabilities",
-                    "data": {},
-                    "response": {
-                        "capabilities": widget_capabilities,
-                    },
-                });
-                if !outbound_handle.send(response.to_string()).await {
-                    break;
-                }
-            }
-            if action == "notify_capabilities" {
-                info!(request_id, "widget acknowledged capabilities");
-                let response = serde_json::json!({
-                    "api": "toWidget",
-                    "widgetId": outbound_widget_id,
-                    "requestId": request_id.clone(),
-                    "action": "notify_capabilities",
-                    "data": {},
-                    "response": {},
-                });
-                if !outbound_handle.send(response.to_string()).await {
-                    break;
-                }
-                let _ = capabilities_ready_tx.send(true);
-            }
-            if action == "send_to_device" {
-                let data = value.get("data").cloned().unwrap_or_else(|| serde_json::json!({}));
-                let event_type = data
-                    .get("event_type")
-                    .and_then(|v| v.as_str())
-                    .or_else(|| data.get("type").and_then(|v| v.as_str()));
-                if event_type == Some("io.element.call.encryption_keys") {
-                    info!(
-                        request_id,
-                        payload = %data,
-                        "widget send_to_device encryption key payload"
-                    );
-                } else {
-                    info!(request_id, event_type, "widget send_to_device received");
-                }
-            }
-        }
-        info!("widget -> rust-sdk message stream closed");
-    });
-
-    let content_loaded = serde_json::json!({
-        "api": "fromWidget",
-        "widgetId": widget_id,
-        "requestId": format!("content-loaded-{}", std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis()),
-        "action": "content_loaded",
-        "data": {},
-    });
-    let _ = handle.send(content_loaded.to_string()).await;
-
-    Ok(Some(ElementCallWidget {
-        handle,
-        widget_id,
-        capabilities_ready: capabilities_ready_rx,
-        pending_widget_responses,
-    }))
-}
-
-#[cfg(not(feature = "experimental-widgets"))]
-async fn start_element_call_widget(
-    _room: matrix_sdk::Room,
-    _element_call_url: String,
-) -> anyhow::Result<Option<ElementCallWidget>> {
-    info!("ELEMENT_CALL_URL set but experimental-widgets feature is disabled");
-    Ok(None)
-}
-
-#[cfg(feature = "experimental-widgets")]
 async fn publish_call_membership_via_widget(
     room: matrix_sdk::Room,
     widget: &ElementCallWidget,
     service_url: &str,
 ) -> anyhow::Result<()> {
-    if !*widget.capabilities_ready.borrow() {
-        let mut capabilities_ready = widget.capabilities_ready.clone();
+    if !*widget.capabilities_ready().borrow() {
+        let mut capabilities_ready = widget.capabilities_ready();
         let _ = capabilities_ready.changed().await;
     }
     let own_user_id = room
@@ -780,34 +516,14 @@ async fn publish_call_membership_via_widget(
         .to_owned();
     let state_key =
         CallMemberStateKey::new(own_user_id.clone(), Some(own_device_id.to_string()), true);
-    let call_id = "".to_string();
-    let application =
-        Application::Call(CallApplicationContent::new(call_id.clone(), CallScope::Room));
-    let focus_active = ActiveFocus::Livekit(ActiveLivekitFocus::new());
-    let focus_alias = format!("{}", room.room_id());
-    let service_url = "https://demo.call.bundesmessenger.info";
-    let foci_preferred =
-        vec![Focus::Livekit(LivekitFocus::new(focus_alias, service_url.to_string()))];
-    let content = CallMemberEventContent::new(
-        application,
-        own_device_id,
-        focus_active,
-        foci_preferred,
-        None,
-        None,
-    );
+    let content = element_call_member_content(room.room_id(), &own_device_id, service_url);
     let request_id = Uuid::new_v4().to_string();
-    let send_event_message = serde_json::json!({
-        "api": "fromWidget",
-        "widgetId": widget.widget_id,
-        "requestId": request_id.clone(),
-        "action": "send_event",
-        "data": {
-            "type": "org.matrix.msc3401.call.member",
-            "state_key": state_key.as_ref(),
-            "content": content,
-        },
-    });
+    let send_event_message = element_call_send_event_message(
+        widget.widget_id(),
+        &request_id,
+        state_key.as_ref(),
+        &content,
+    );
 
     let send_event_message_json = send_event_message.to_string();
     info!(
@@ -815,7 +531,7 @@ async fn publish_call_membership_via_widget(
         "Publishing MatrixRTC membership send_event via widget api"
     );
 
-    if !widget.handle.send(send_event_message.to_string()).await {
+    if !widget.handle().send(send_event_message.to_string()).await {
         return Err(anyhow!("widget driver handle closed before sending membership send_event"));
     }
 
@@ -830,30 +546,21 @@ async fn send_hangup_via_widget(
 ) -> anyhow::Result<()> {
     const SHUTDOWN_WIDGET_WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
-    if !*widget.capabilities_ready.borrow() {
-        let mut capabilities_ready = widget.capabilities_ready.clone();
+    if !*widget.capabilities_ready().borrow() {
+        let mut capabilities_ready = widget.capabilities_ready();
         let _ =
             tokio::time::timeout(SHUTDOWN_WIDGET_WAIT_TIMEOUT, capabilities_ready.changed()).await;
     }
 
     let request_id = Uuid::new_v4().to_string();
-    let (response_tx, response_rx) = oneshot::channel();
-    if let Ok(mut pending) = widget.pending_widget_responses.lock() {
-        pending.insert(request_id.clone(), response_tx);
-    }
-
+    let response_rx = widget.track_pending_response(request_id.clone());
     let state_key = state_key.map(|state_key| state_key.as_ref()).unwrap_or_default();
-    let shutdown_message = serde_json::json!({
-        "api": "fromWidget",
-        "widgetId": widget.widget_id,
-        "requestId": request_id.clone(),
-        "action": "send_event",
-        "data": {
-            "type": "org.matrix.msc3401.call.member",
-            "state_key": state_key,
-            "content": {},
-        },
-    });
+    let shutdown_message = element_call_send_event_message(
+        widget.widget_id(),
+        &request_id,
+        state_key,
+        &serde_json::json!({}),
+    );
     info!(
         request_body = shutdown_message.to_string().as_str(),
         "sending shutdown membership send_event via widget api"
@@ -861,23 +568,19 @@ async fn send_hangup_via_widget(
 
     match tokio::time::timeout(
         SHUTDOWN_WIDGET_WAIT_TIMEOUT,
-        widget.handle.send(shutdown_message.to_string()),
+        widget.handle().send(shutdown_message.to_string()),
     )
     .await
     {
         Ok(true) => info!("shutdown membership send_event sent via widget api"),
         Ok(false) => {
-            if let Ok(mut pending) = widget.pending_widget_responses.lock() {
-                pending.remove(&request_id);
-            }
+            widget.remove_pending_response(&request_id);
             return Err(anyhow!(
                 "widget driver handle closed before sending shutdown membership send_event"
             ));
         }
         Err(_) => {
-            if let Ok(mut pending) = widget.pending_widget_responses.lock() {
-                pending.remove(&request_id);
-            }
+            widget.remove_pending_response(&request_id);
             info!(
                 "timeout while sending shutdown membership send_event via widget api; continuing shutdown"
             );
@@ -894,9 +597,7 @@ async fn send_hangup_via_widget(
             "shutdown membership send_event response channel closed; continuing shutdown"
         ),
         Err(_) => {
-            if let Ok(mut pending) = widget.pending_widget_responses.lock() {
-                pending.remove(&request_id);
-            }
+            widget.remove_pending_response(&request_id);
             info!(
                 request_id,
                 "timeout waiting for widget shutdown membership send_event response; continuing shutdown"

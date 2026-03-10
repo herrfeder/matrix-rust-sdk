@@ -18,12 +18,12 @@
 use std::{fmt, future::Future};
 
 use matrix_sdk_common::{SendOutsideWasm, SyncOutsideWasm};
-use serde::{Deserialize, Deserializer, Serialize, Serializer, ser::SerializeSeq};
+use serde::{ser::SerializeSeq, Deserialize, Deserializer, Serialize, Serializer};
 use tracing::{debug, warn};
 
 use super::{
-    MessageLikeEventFilter, StateEventFilter,
     filter::{Filter, FilterInput, ToDeviceEventFilter},
+    MessageLikeEventFilter, StateEventFilter,
 };
 
 /// Must be implemented by a component that provides functionality of deciding
@@ -37,6 +37,30 @@ pub trait CapabilitiesProvider: SendOutsideWasm + SyncOutsideWasm + 'static {
         &self,
         capabilities: Capabilities,
     ) -> impl Future<Output = Capabilities> + SendOutsideWasm;
+}
+
+/// A [`CapabilitiesProvider`] that always returns a static capability set.
+#[derive(Clone, Debug)]
+pub struct StaticCapabilitiesProvider {
+    capabilities: Capabilities,
+}
+
+impl StaticCapabilitiesProvider {
+    /// Create a new static capabilities provider.
+    pub fn new(capabilities: Capabilities) -> Self {
+        Self { capabilities }
+    }
+
+    /// Get the configured capabilities.
+    pub fn capabilities(&self) -> &Capabilities {
+        &self.capabilities
+    }
+}
+
+impl CapabilitiesProvider for StaticCapabilitiesProvider {
+    async fn acquire_capabilities(&self, _capabilities: Capabilities) -> Capabilities {
+        self.capabilities.clone()
+    }
 }
 
 /// Capabilities that a widget can request from a client.
