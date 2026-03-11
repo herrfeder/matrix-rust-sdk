@@ -39,7 +39,7 @@ rand = { version = "0.8.0" }
 workspace = true
 
 [features]
-default = ["rustls-tls"]
+default = []
 rustls-tls = ["matrix-sdk/rustls-tls", "matrix-sdk-rtc/rustls-tls", "matrix-sdk-rtc-livekit/rustls-tls"]
 native-tls = ["matrix-sdk/native-tls", "matrix-sdk-rtc/native-tls", "matrix-sdk-rtc-livekit/native-tls"]
 v4l2 = ["dep:v4l"]

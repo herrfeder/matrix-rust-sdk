@@ -144,14 +144,13 @@ the LiveKit crate is built with TLS enabled. You can force a TLS backend with
 either of these:
 
 ```bash
-cargo run -p example-rtc-livekit-join --no-default-features --features native-tls
+cargo run -p example-rtc-livekit-join --features native-tls
 # or
-cargo run -p example-rtc-livekit-join --no-default-features --features rustls-tls
+cargo run -p example-rtc-livekit-join --features rustls-tls
 ```
 
-By default this example enables `rustls-tls`. Only enable one TLS backend at a
-time; `native-tls` and `rustls-tls` are mutually exclusive. If you select
-`native-tls`, pass `--no-default-features`.
+Only enable one TLS backend at a time; `native-tls` and `rustls-tls` are
+mutually exclusive.
 
 ### Room identifier
 
