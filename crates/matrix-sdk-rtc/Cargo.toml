@@ -11,10 +11,10 @@ rust-version.workspace = true
 rustdoc-args = ["--generate-link-to-definition"]
 
 [features]
-default = ["native-tls"]
+default = ["rustls-tls"]
 
-native-tls = ["matrix-sdk/native-tls"]
 rustls-tls = ["matrix-sdk/rustls-tls"]
+native-tls = ["matrix-sdk/native-tls"]
 js = ["matrix-sdk/js"]
 
 [dependencies]
