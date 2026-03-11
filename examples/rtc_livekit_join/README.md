@@ -144,9 +144,9 @@ the LiveKit crate is built with TLS enabled. You can force a TLS backend with
 either of these:
 
 ```bash
-cargo run -p example-rtc-livekit-join --features matrix-sdk-rtc-livekit/native-tls
+cargo run -p example-rtc-livekit-join --features native-tls
 # or
-cargo run -p example-rtc-livekit-join --features matrix-sdk-rtc-livekit/rustls-tls
+cargo run -p example-rtc-livekit-join --features rustls-tls
 ```
 
 Only enable one TLS backend at a time; `native-tls` and `rustls-tls` are
