@@ -29,7 +29,11 @@ enum V4l2VideoSource {
     #[default]
     Camera,
     TestRedFrames,
+    ZmqQueue,
 }
+
+#[cfg(all(feature = "v4l2", target_os = "linux"))]
+const ZMQ_SOURCE_FRAMERATE: u32 = 30;
 
 #[cfg(all(feature = "v4l2", target_os = "linux"))]
 #[derive(Debug)]
@@ -110,6 +114,9 @@ impl V4l2CameraPublisher {
             V4l2CaptureMode::TestRedFrames => {
                 run_generated_red_capture_loop(resolution, rtc_source, stop_rx)
             }
+            V4l2CaptureMode::ZmqQueue { endpoint } => {
+                run_zmq_capture_loop(resolution, rtc_source, stop_rx, endpoint, text_overlay)
+            }
         });
 
         Ok(Self { room, track, stop_tx, task, stdin_overlay_task })
@@ -133,6 +140,7 @@ impl V4l2CameraPublisher {
 enum V4l2CaptureMode {
     Camera { device: v4l::Device, pixel_format: V4l2PixelFormat },
     TestRedFrames,
+    ZmqQueue { endpoint: String },
 }
 
 #[cfg(all(feature = "v4l2", target_os = "linux"))]
@@ -158,6 +166,25 @@ fn configure_v4l2_capture_mode(
             "configured generated red test video source"
         );
         return Ok((resolution, rtc_source, V4l2CaptureMode::TestRedFrames));
+    }
+
+    if matches!(config.source, V4l2VideoSource::ZmqQueue) {
+        let width = config.width.unwrap_or(640);
+        let height = config.height.unwrap_or(480);
+        let resolution = VideoResolution { width, height };
+        let rtc_source = NativeVideoSource::new(resolution.clone(), true);
+        info!(
+            width = resolution.width,
+            height = resolution.height,
+            endpoint = %config.device,
+            framerate = ZMQ_SOURCE_FRAMERATE,
+            "configured ZMQ queue video source"
+        );
+        return Ok((
+            resolution,
+            rtc_source,
+            V4l2CaptureMode::ZmqQueue { endpoint: config.device.clone() },
+        ));
     }
 
     use v4l::video::Capture;
@@ -342,6 +369,98 @@ fn run_generated_red_capture_loop(
 }
 
 #[cfg(all(feature = "v4l2", target_os = "linux"))]
+fn run_zmq_capture_loop(
+    resolution: matrix_sdk_rtc_livekit::livekit::webrtc::prelude::VideoResolution,
+    rtc_source: matrix_sdk_rtc_livekit::livekit::webrtc::video_source::native::NativeVideoSource,
+    stop_rx: std::sync::mpsc::Receiver<()>,
+    endpoint: String,
+    text_overlay: Arc<Mutex<TextOverlayState>>,
+) -> anyhow::Result<()> {
+    use matrix_sdk_rtc_livekit::livekit::webrtc::prelude::{I420Buffer, VideoFrame, VideoRotation};
+
+    let context = zmq::Context::new();
+    let socket = context.socket(zmq::SUB).context("create ZMQ SUB socket")?;
+    socket.set_subscribe(b"").context("subscribe to ZMQ queue")?;
+    socket.set_rcvtimeo(100).context("set ZMQ receive timeout")?;
+    socket.connect(&endpoint).with_context(|| format!("connect to ZMQ endpoint {endpoint}"))?;
+
+    let width = resolution.width as usize;
+    let height = resolution.height as usize;
+    let expected_y_len = width * height;
+    let expected_u_len = expected_y_len / 4;
+    let expected_v_len = expected_u_len;
+    let expected_size = expected_y_len + expected_u_len + expected_v_len;
+
+    let mut frame = VideoFrame {
+        rotation: VideoRotation::VideoRotation0,
+        buffer: I420Buffer::new(resolution.width, resolution.height),
+        timestamp_us: 0,
+    };
+
+    let frame_duration = std::time::Duration::from_millis(1000 / ZMQ_SOURCE_FRAMERATE as u64);
+    let start = std::time::Instant::now();
+
+    loop {
+        if stop_rx.try_recv().is_ok() {
+            break;
+        }
+
+        let payload = match socket.recv_bytes(0) {
+            Ok(data) => data,
+            Err(zmq::Error::EAGAIN) => continue,
+            Err(err) => return Err(anyhow!(err).context("receive frame from ZMQ queue")),
+        };
+
+        if payload.len() != expected_size {
+            warn!(
+                payload_len = payload.len(),
+                expected_size,
+                "dropping ZMQ frame with unexpected size (expected raw I420 payload)"
+            );
+            continue;
+        }
+
+        let (stride_y, stride_u, stride_v) = frame.buffer.strides();
+        let (dst_y, dst_u, dst_v) = frame.buffer.data_mut();
+
+        copy_plane(&payload[..expected_y_len], width, height, dst_y, stride_y as usize);
+        copy_plane(
+            &payload[expected_y_len..expected_y_len + expected_u_len],
+            width / 2,
+            height / 2,
+            dst_u,
+            stride_u as usize,
+        );
+        copy_plane(
+            &payload[expected_y_len + expected_u_len..],
+            width / 2,
+            height / 2,
+            dst_v,
+            stride_v as usize,
+        );
+
+        if let Ok(mut overlay) = text_overlay.lock() {
+            overlay.tick_and_draw(&resolution, dst_y, stride_y, dst_u, stride_u, dst_v, stride_v);
+        }
+
+        frame.timestamp_us = start.elapsed().as_micros() as i64;
+        rtc_source.capture_frame(&frame);
+        std::thread::sleep(frame_duration);
+    }
+
+    Ok(())
+}
+
+#[cfg(all(feature = "v4l2", target_os = "linux"))]
+fn copy_plane(src: &[u8], width: usize, height: usize, dst: &mut [u8], dst_stride: usize) {
+    for row in 0..height {
+        let src_start = row * width;
+        let dst_start = row * dst_stride;
+        dst[dst_start..dst_start + width].copy_from_slice(&src[src_start..src_start + width]);
+    }
+}
+
+#[cfg(all(feature = "v4l2", target_os = "linux"))]
 fn fill_plane(dst: &mut [u8], stride: usize, width: usize, height: usize, value: u8) {
     for y in 0..height {
         let row = &mut dst[y * stride..y * stride + width];
@@ -432,9 +551,12 @@ pub(crate) fn v4l2_config_from_env() -> anyhow::Result<Option<V4l2Config>> {
     {
         Some("camera") | Some("webcam") | None => V4l2VideoSource::Camera,
         Some("test_red") | Some("test-red") | Some("red") => V4l2VideoSource::TestRedFrames,
+        Some("zmq") | Some("queue") | Some("zmq_queue") | Some("zmq-queue") => {
+            V4l2VideoSource::ZmqQueue
+        }
         Some(other) => {
             return Err(anyhow!(
-                "invalid V4L2_VIDEO_SOURCE '{other}'; expected camera|webcam|test_red|test-red|red"
+                "invalid V4L2_VIDEO_SOURCE '{other}'; expected camera|webcam|test_red|test-red|red|zmq|queue|zmq_queue|zmq-queue"
             ));
         }
     };
@@ -444,6 +566,10 @@ pub(crate) fn v4l2_config_from_env() -> anyhow::Result<Option<V4l2Config>> {
             Some(device) => device,
             None => return Ok(None),
         }
+    } else if matches!(source, V4l2VideoSource::ZmqQueue) {
+        let ip = optional_env("V4L2_ZMQ_IP").unwrap_or_else(|| "127.0.0.1".to_owned());
+        let port = optional_env("V4L2_ZMQ_PORT").unwrap_or_else(|| "5555".to_owned());
+        format!("tcp://{ip}:{port}")
     } else {
         optional_env("V4L2_DEVICE").unwrap_or_else(|| "generated-test-source".to_owned())
     };

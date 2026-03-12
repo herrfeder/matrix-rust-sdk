@@ -78,6 +78,29 @@ RUST_LOG=info \
 cargo run -p example-rtc-livekit-join --features v4l2
 ```
 
+
+To publish frames from a ZeroMQ queue instead of a local camera, set
+`V4L2_VIDEO_SOURCE=zmq` and provide the source address through
+`V4L2_ZMQ_IP` and `V4L2_ZMQ_PORT`. The consumer currently expects raw I420
+frames and uses the framerate configured in code (`ZMQ_SOURCE_FRAMERATE` in
+`videosource.rs`):
+
+```bash
+HOMESERVER_URL=https://matrix.example.org \
+MATRIX_USERNAME=@alice:example.org \
+MATRIX_PASSWORD=secret \
+ROOM_ID=!roomid:example.org \
+LIVEKIT_SERVICE_URL=wss://livekit.example.org \
+LIVEKIT_TOKEN=your-token \
+V4L2_VIDEO_SOURCE=zmq \
+V4L2_ZMQ_IP=127.0.0.1 \
+V4L2_ZMQ_PORT=5555 \
+V4L2_WIDTH=1280 \
+V4L2_HEIGHT=720 \
+RUST_LOG=info \
+cargo run -p example-rtc-livekit-join --features v4l2
+```
+
 To enable per-participant E2EE (MSC4268 key bundles), add the
 `e2ee-per-participant` feature:
 
@@ -96,10 +119,16 @@ Notes:
   ```
 
 - `V4L2_VIDEO_SOURCE` selects the published source: `camera`/`webcam` (default)
-  or `test_red`/`test-red`/`red` for generated red frames.
+  or `test_red`/`test-red`/`red` for generated red frames, or `zmq`/`queue`/`zmq_queue`/`zmq-queue` for a ZeroMQ queue.
 - `V4L2_WIDTH` and `V4L2_HEIGHT` are optional; for camera mode, the current
   device format is used when omitted. For generated red frames, they default to
   640x480.
+- `V4L2_ZMQ_IP` and `V4L2_ZMQ_PORT` select the ZeroMQ source endpoint when
+  `V4L2_VIDEO_SOURCE` is set to one of the ZMQ variants.
+- ZMQ mode expects raw I420 frames (Y plane + U plane + V plane) sized
+  according to `V4L2_WIDTH`/`V4L2_HEIGHT` (defaults to 640x480).
+- ZMQ publish pacing is configured in code via `ZMQ_SOURCE_FRAMERATE` in
+  `videosource.rs`.
 - Text read from `stdin` is overlaid in the middle of outgoing camera frames using
   large shiny letters.
 
