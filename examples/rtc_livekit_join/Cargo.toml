@@ -34,7 +34,7 @@ url.workspace = true
 uuid.workspace = true
 v4l = { version = "0.14", optional = true }
 rand = { version = "0.8.0" }
-zmq = "0.10"
+zeromq = { version = "0.4", default-features = false, features = ["tcp-transport"] }
 
 [lints]
 workspace = true

@@ -378,11 +378,22 @@ fn run_zmq_capture_loop(
 ) -> anyhow::Result<()> {
     use matrix_sdk_rtc_livekit::livekit::webrtc::prelude::{I420Buffer, VideoFrame, VideoRotation};
 
-    let context = zmq::Context::new();
-    let socket = context.socket(zmq::SUB).context("create ZMQ SUB socket")?;
-    socket.set_subscribe(b"").context("subscribe to ZMQ queue")?;
-    socket.set_rcvtimeo(100).context("set ZMQ receive timeout")?;
-    socket.connect(&endpoint).with_context(|| format!("connect to ZMQ endpoint {endpoint}"))?;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("create local runtime for ZMQ source")?;
+
+    let mut socket = runtime.block_on(async {
+        use zeromq::{Socket, SubSocket};
+
+        let mut socket = SubSocket::new();
+        socket
+            .connect(&endpoint)
+            .await
+            .with_context(|| format!("connect to ZMQ endpoint {endpoint}"))?;
+        socket.subscribe("").await.context("subscribe to ZMQ queue")?;
+        anyhow::Ok(socket)
+    })?;
 
     let width = resolution.width as usize;
     let height = resolution.height as usize;
@@ -405,11 +416,21 @@ fn run_zmq_capture_loop(
             break;
         }
 
-        let payload = match socket.recv_bytes(0) {
-            Ok(data) => data,
-            Err(zmq::Error::EAGAIN) => continue,
-            Err(err) => return Err(anyhow!(err).context("receive frame from ZMQ queue")),
+        let payload = match runtime.block_on(async {
+            use tokio::time::{timeout, Duration};
+            use zeromq::SocketRecv;
+
+            match timeout(Duration::from_millis(100), socket.recv()).await {
+                Ok(Ok(message)) => Ok(Some(message)),
+                Ok(Err(err)) => Err(anyhow!(err).context("receive frame from ZMQ queue")),
+                Err(_) => Ok(None),
+            }
+        })? {
+            Some(message) => message.into_vec(),
+            None => continue,
         };
+
+        let payload = payload.first().cloned().unwrap_or_default();
 
         if payload.len() != expected_size {
             warn!(
