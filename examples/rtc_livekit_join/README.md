@@ -81,8 +81,9 @@ cargo run -p example-rtc-livekit-join --features v4l2
 
 To publish frames from a ZeroMQ queue instead of a local camera, set
 `V4L2_VIDEO_SOURCE=zmq` and provide the source address through
-`V4L2_ZMQ_IP` and `V4L2_ZMQ_PORT`. The consumer currently expects raw I420
-frames and uses the framerate configured in code (`ZMQ_SOURCE_FRAMERATE` in
+`V4L2_ZMQ_IP` and `V4L2_ZMQ_PORT`. You can also set
+`V4L2_ZMQ_PIXEL_FORMAT` (`nv12` default, or `i420` / `yuyv`). The consumer
+uses the framerate configured in code (`ZMQ_SOURCE_FRAMERATE` in
 `videosource.rs`):
 
 ```bash
@@ -95,6 +96,7 @@ LIVEKIT_TOKEN=your-token \
 V4L2_VIDEO_SOURCE=zmq \
 V4L2_ZMQ_IP=127.0.0.1 \
 V4L2_ZMQ_PORT=5555 \
+V4L2_ZMQ_PIXEL_FORMAT=nv12 \
 V4L2_WIDTH=1280 \
 V4L2_HEIGHT=720 \
 RUST_LOG=info \
@@ -125,8 +127,10 @@ Notes:
   640x480.
 - `V4L2_ZMQ_IP` and `V4L2_ZMQ_PORT` select the ZeroMQ source endpoint when
   `V4L2_VIDEO_SOURCE` is set to one of the ZMQ variants.
-- ZMQ mode expects raw I420 frames (Y plane + U plane + V plane) sized
-  according to `V4L2_WIDTH`/`V4L2_HEIGHT` (defaults to 640x480).
+- ZMQ mode expects raw uncompressed frames sized according to
+  `V4L2_WIDTH`/`V4L2_HEIGHT` (defaults to 640x480).
+  `V4L2_ZMQ_PIXEL_FORMAT` controls interpretation: `nv12` (default), `i420`,
+  or `yuyv`.
 - ZMQ publish pacing is configured in code via `ZMQ_SOURCE_FRAMERATE` in
   `videosource.rs`.
 - Text read from `stdin` is overlaid in the middle of outgoing camera frames using

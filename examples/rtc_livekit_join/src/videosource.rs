@@ -66,6 +66,15 @@ enum V4l2PixelFormat {
 }
 
 #[cfg(all(feature = "v4l2", target_os = "linux"))]
+#[derive(Copy, Clone, Debug, Default)]
+enum ZmqPixelFormat {
+    I420,
+    #[default]
+    Nv12,
+    Yuyv,
+}
+
+#[cfg(all(feature = "v4l2", target_os = "linux"))]
 impl V4l2CameraPublisher {
     pub(crate) async fn start(
         room: std::sync::Arc<Room>,
@@ -114,9 +123,14 @@ impl V4l2CameraPublisher {
             V4l2CaptureMode::TestRedFrames => {
                 run_generated_red_capture_loop(resolution, rtc_source, stop_rx)
             }
-            V4l2CaptureMode::ZmqQueue { endpoint } => {
-                run_zmq_capture_loop(resolution, rtc_source, stop_rx, endpoint, text_overlay)
-            }
+            V4l2CaptureMode::ZmqQueue { endpoint, pixel_format } => run_zmq_capture_loop(
+                resolution,
+                rtc_source,
+                stop_rx,
+                endpoint,
+                pixel_format,
+                text_overlay,
+            ),
         });
 
         Ok(Self { room, track, stop_tx, task, stdin_overlay_task })
@@ -140,7 +154,7 @@ impl V4l2CameraPublisher {
 enum V4l2CaptureMode {
     Camera { device: v4l::Device, pixel_format: V4l2PixelFormat },
     TestRedFrames,
-    ZmqQueue { endpoint: String },
+    ZmqQueue { endpoint: String, pixel_format: ZmqPixelFormat },
 }
 
 #[cfg(all(feature = "v4l2", target_os = "linux"))]
@@ -173,17 +187,19 @@ fn configure_v4l2_capture_mode(
         let height = config.height.unwrap_or(480);
         let resolution = VideoResolution { width, height };
         let rtc_source = NativeVideoSource::new(resolution.clone(), true);
+        let pixel_format = zmq_pixel_format_from_env()?;
         info!(
             width = resolution.width,
             height = resolution.height,
             endpoint = %config.device,
             framerate = ZMQ_SOURCE_FRAMERATE,
+            pixel_format = ?pixel_format,
             "configured ZMQ queue video source"
         );
         return Ok((
             resolution,
             rtc_source,
-            V4l2CaptureMode::ZmqQueue { endpoint: config.device.clone() },
+            V4l2CaptureMode::ZmqQueue { endpoint: config.device.clone(), pixel_format },
         ));
     }
 
@@ -374,6 +390,7 @@ fn run_zmq_capture_loop(
     rtc_source: matrix_sdk_rtc_livekit::livekit::webrtc::video_source::native::NativeVideoSource,
     stop_rx: std::sync::mpsc::Receiver<()>,
     endpoint: String,
+    pixel_format: ZmqPixelFormat,
     text_overlay: Arc<Mutex<TextOverlayState>>,
 ) -> anyhow::Result<()> {
     use matrix_sdk_rtc_livekit::livekit::webrtc::prelude::{I420Buffer, VideoFrame, VideoRotation};
@@ -397,10 +414,11 @@ fn run_zmq_capture_loop(
 
     let width = resolution.width as usize;
     let height = resolution.height as usize;
-    let expected_y_len = width * height;
-    let expected_u_len = expected_y_len / 4;
-    let expected_v_len = expected_u_len;
-    let expected_size = expected_y_len + expected_u_len + expected_v_len;
+    let expected_i420_size = width * height * 3 / 2;
+    let expected_size = match pixel_format {
+        ZmqPixelFormat::I420 | ZmqPixelFormat::Nv12 => expected_i420_size,
+        ZmqPixelFormat::Yuyv => width * height * 2,
+    };
 
     let mut frame = VideoFrame {
         rotation: VideoRotation::VideoRotation0,
@@ -416,27 +434,35 @@ fn run_zmq_capture_loop(
             break;
         }
 
-        let payload = match runtime.block_on(async {
+        let payload_parts = match runtime.block_on(async {
             use tokio::time::{timeout, Duration};
             use zeromq::SocketRecv;
 
             match timeout(Duration::from_millis(100), socket.recv()).await {
-                Ok(Ok(message)) => Ok(Some(message)),
+                Ok(Ok(message)) => Ok(Some(message.into_vec())),
                 Ok(Err(err)) => Err(anyhow!(err).context("receive frame from ZMQ queue")),
                 Err(_) => Ok(None),
             }
         })? {
-            Some(message) => message.into_vec(),
+            Some(parts) => parts,
             None => continue,
         };
 
-        let payload = payload.first().cloned().unwrap_or_default();
+        let payload = payload_parts
+            .iter()
+            .find(|part| part.len() == expected_size)
+            .or_else(|| payload_parts.last());
+
+        let Some(payload) = payload else {
+            continue;
+        };
 
         if payload.len() != expected_size {
             warn!(
                 payload_len = payload.len(),
                 expected_size,
-                "dropping ZMQ frame with unexpected size (expected raw I420 payload)"
+                num_parts = payload_parts.len(),
+                "dropping ZMQ frame with unexpected size for configured pixel format"
             );
             continue;
         }
@@ -444,21 +470,61 @@ fn run_zmq_capture_loop(
         let (stride_y, stride_u, stride_v) = frame.buffer.strides();
         let (dst_y, dst_u, dst_v) = frame.buffer.data_mut();
 
-        copy_plane(&payload[..expected_y_len], width, height, dst_y, stride_y as usize);
-        copy_plane(
-            &payload[expected_y_len..expected_y_len + expected_u_len],
-            width / 2,
-            height / 2,
-            dst_u,
-            stride_u as usize,
-        );
-        copy_plane(
-            &payload[expected_y_len + expected_u_len..],
-            width / 2,
-            height / 2,
-            dst_v,
-            stride_v as usize,
-        );
+        match pixel_format {
+            ZmqPixelFormat::I420 => {
+                let expected_y_len = width * height;
+                let expected_u_len = expected_y_len / 4;
+                copy_plane(&payload[..expected_y_len], width, height, dst_y, stride_y as usize);
+                copy_plane(
+                    &payload[expected_y_len..expected_y_len + expected_u_len],
+                    width / 2,
+                    height / 2,
+                    dst_u,
+                    stride_u as usize,
+                );
+                copy_plane(
+                    &payload[expected_y_len + expected_u_len..],
+                    width / 2,
+                    height / 2,
+                    dst_v,
+                    stride_v as usize,
+                );
+            }
+            ZmqPixelFormat::Nv12 => {
+                use matrix_sdk_rtc_livekit::livekit::webrtc::native::yuv_helper;
+
+                let y_plane_len = width * height;
+                let (src_y, src_uv) = payload.split_at(y_plane_len);
+                yuv_helper::nv12_to_i420(
+                    src_y,
+                    width as u32,
+                    src_uv,
+                    width as u32,
+                    dst_y,
+                    stride_y,
+                    dst_u,
+                    stride_u,
+                    dst_v,
+                    stride_v,
+                    resolution.width as i32,
+                    resolution.height as i32,
+                );
+            }
+            ZmqPixelFormat::Yuyv => {
+                yuyv_to_i420(
+                    &payload,
+                    width,
+                    width * 2,
+                    height,
+                    dst_y,
+                    stride_y,
+                    dst_u,
+                    stride_u,
+                    dst_v,
+                    stride_v,
+                );
+            }
+        }
 
         if let Ok(mut overlay) = text_overlay.lock() {
             overlay.tick_and_draw(&resolution, dst_y, stride_y, dst_u, stride_u, dst_v, stride_v);
@@ -559,6 +625,18 @@ fn yuyv_to_i420(
             let v1 = src_row1[base + 3] as u16;
             dst_u_row[x] = ((u0 + u1) / 2) as u8;
             dst_v_row[x] = ((v0 + v1) / 2) as u8;
+        }
+    }
+}
+
+#[cfg(all(feature = "v4l2", target_os = "linux"))]
+fn zmq_pixel_format_from_env() -> anyhow::Result<ZmqPixelFormat> {
+    match optional_env("V4L2_ZMQ_PIXEL_FORMAT").as_deref().map(str::to_ascii_lowercase).as_deref() {
+        None | Some("nv12") => Ok(ZmqPixelFormat::Nv12),
+        Some("i420") => Ok(ZmqPixelFormat::I420),
+        Some("yuyv") => Ok(ZmqPixelFormat::Yuyv),
+        Some(other) => {
+            Err(anyhow!("invalid V4L2_ZMQ_PIXEL_FORMAT '{other}'; expected nv12|i420|yuyv"))
         }
     }
 }
