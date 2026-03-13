@@ -51,7 +51,7 @@ impl std::error::Error for V4l2PublishError {}
 
 #[cfg(all(feature = "v4l2", target_os = "linux"))]
 pub(crate) struct V4l2CameraPublisher {
-    room: std::sync::Arc<Room>,
+    room: Arc<Room>,
     track: matrix_sdk_rtc_livekit::livekit::track::LocalVideoTrack,
     stop_tx: std::sync::mpsc::Sender<()>,
     task: tokio::task::JoinHandle<anyhow::Result<()>>,
@@ -87,7 +87,7 @@ enum ZmqPayloadEncoding {
 #[cfg(all(feature = "v4l2", target_os = "linux"))]
 impl V4l2CameraPublisher {
     pub(crate) async fn start(
-        room: std::sync::Arc<Room>,
+        room: Arc<Room>,
         config: V4l2Config,
     ) -> anyhow::Result<Self> {
         use matrix_sdk_rtc_livekit::livekit::options::{TrackPublishOptions, VideoCodec};

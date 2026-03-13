@@ -98,7 +98,7 @@ async fn run_rtc_livekit_join() -> anyhow::Result<()> {
     let v4l2_config = v4l2_config_from_env().context("read V4L2 config")?;
 
     let store_dir =
-        std::env::current_dir().context("read current directory")?.join("matrix-sdk-store");
+        env::current_dir().context("read current directory")?.join("matrix-sdk-store");
     if store_dir.is_file() {
         warn!(
             store_path = %store_dir.display(),
@@ -711,7 +711,7 @@ fn build_driver_state(
 
 async fn set_video_stream_enabled(
     state: &mut DriverState,
-    room_handle: Option<std::sync::Arc<Room>>,
+    room_handle: Option<Arc<Room>>,
     enabled: bool,
 ) -> LiveKitResult<()> {
     #[cfg(not(all(feature = "v4l2", target_os = "linux")))]
@@ -793,7 +793,7 @@ async fn handle_driver_connection_update(
                 }
 
                 if let Some(events) = livekit_events {
-                    spawn_livekit_e2ee_event_resend(room_handle.clone(), events, context.clone());
+                    spawn_livekit_e2ee_event_resend(state.room.clone(), events, context.clone());
                 }
             }
             set_video_stream_enabled(&mut state, Some(room_handle), true).await?;
