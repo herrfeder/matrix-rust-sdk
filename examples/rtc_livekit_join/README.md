@@ -140,6 +140,8 @@ Notes:
   dimensions matching `V4L2_WIDTH`/`V4L2_HEIGHT`.
 - ZMQ publish pacing is configured in code via `ZMQ_SOURCE_FRAMERATE` in
   `videosource.rs`.
+- ZMQ input handling keeps only the latest queued message when multiple
+  frames are buffered, to reduce end-to-end latency under load.
 - Text read from `stdin` is overlaid in the middle of outgoing camera frames using
   large shiny letters.
 

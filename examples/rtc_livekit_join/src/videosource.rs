@@ -471,16 +471,7 @@ fn run_zmq_capture_loop(
             break;
         }
 
-        let payload_parts = match runtime.block_on(async {
-            use tokio::time::{timeout, Duration};
-            use zeromq::SocketRecv;
-
-            match timeout(Duration::from_millis(100), socket.recv()).await {
-                Ok(Ok(message)) => Ok(Some(message.into_vec())),
-                Ok(Err(err)) => Err(anyhow!(err).context("receive frame from ZMQ queue")),
-                Err(_) => Ok(None),
-            }
-        })? {
+        let payload_parts = match recv_latest_zmq_message_parts(&runtime, &mut socket)? {
             Some(parts) => parts,
             None => continue,
         };
@@ -603,6 +594,43 @@ fn run_zmq_capture_loop(
     }
 
     Ok(())
+}
+
+#[cfg(all(feature = "v4l2", target_os = "linux"))]
+fn recv_latest_zmq_message_parts(
+    runtime: &tokio::runtime::Runtime,
+    socket: &mut zeromq::SubSocket,
+) -> anyhow::Result<Option<Vec<Vec<u8>>>> {
+    runtime.block_on(async {
+        use tokio::time::{timeout, Duration};
+        use zeromq::SocketRecv;
+
+        let mut latest = match timeout(Duration::from_millis(100), socket.recv()).await {
+            Ok(Ok(message)) => message.into_vec(),
+            Ok(Err(err)) => return Err(anyhow!(err).context("receive frame from ZMQ queue")),
+            Err(_) => return Ok(None),
+        };
+
+        let mut dropped_messages = 0usize;
+        loop {
+            match timeout(Duration::from_millis(1), socket.recv()).await {
+                Ok(Ok(message)) => {
+                    latest = message.into_vec();
+                    dropped_messages += 1;
+                }
+                Ok(Err(err)) => {
+                    return Err(anyhow!(err).context("drain queued ZMQ frames"));
+                }
+                Err(_) => break,
+            }
+        }
+
+        if dropped_messages > 0 {
+            debug!(dropped_messages, "dropped stale queued ZMQ messages and kept latest frame");
+        }
+
+        Ok(Some(latest))
+    })
 }
 
 #[cfg(all(feature = "v4l2", target_os = "linux"))]
