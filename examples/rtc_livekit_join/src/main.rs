@@ -163,8 +163,6 @@ async fn run_rtc_livekit_join() -> anyhow::Result<()> {
         login_builder = login_builder.device_id(device_id);
     }
     login_builder.send().await.context("login Matrix user")?;
-    import_recovery_key_if_set(&client).await.context("import recovery key")?;
-    log_backup_state(&client).await;
 
     let room_id_or_alias = RoomOrAliasId::parse(room_id_or_alias).context("parse ROOM_ID")?;
     let via_servers = via_servers_from_env().context("parse VIA_SERVERS")?;
@@ -178,7 +176,6 @@ async fn run_rtc_livekit_join() -> anyhow::Result<()> {
             .await
             .context("join room")?,
     };
-    spawn_backup_diagnostics(client.clone(), room.room_id().to_owned());
     let element_call_url =
         optional_env("ELEMENT_CALL_URL").or_else(|| optional_env("ELEMENT_CALL_WIDGET"));
     #[cfg(feature = "experimental-widgets")]
@@ -237,21 +234,6 @@ async fn run_rtc_livekit_join() -> anyhow::Result<()> {
 
     let sync_client = client.clone();
     let sync_handle = tokio::spawn(async move { sync_client.sync(SyncSettings::new()).await });
-
-    // NOTE: Joining a call requires publishing MatrixRTC memberships (m.call.member) for
-    // this device. When the optional Element Call widget wiring is enabled, this example
-    // publishes a membership via the widget API before starting the driver so the
-    // membership is visible to other clients.
-    //
-    // The optional Element Call widget wiring is how a Rust client can integrate
-    // with the Element Call webapp:
-    // - The widget driver bridges postMessage traffic to/from the webview/iframe.
-    // - Capabilities allow Element Call to send/receive to-device encryption keys
-    //   (io.element.call.encryption_keys), which the Rust SDK consumes for per-participant
-    //   E2EE when enabled.
-    // - When running Element Call inside element-web directly (not embedded), the widget
-    //   bridge logs below will not appear because the Rust SDK is not connected to that
-    //   webview's postMessage channel.
 
     let static_livekit_token = optional_env("LIVEKIT_TOKEN");
     let connection_details = resolve_connection_details(
@@ -408,74 +390,6 @@ fn retry_seconds_from_env(name: &str, default: u64) -> u64 {
     optional_env(name).and_then(|value| value.parse::<u64>().ok()).unwrap_or(default)
 }
 
-#[cfg(feature = "e2e-encryption")]
-async fn import_recovery_key_if_set(client: &Client) -> anyhow::Result<()> {
-    let Some(recovery_key) = optional_env("MATRIX_RECOVERY_KEY") else {
-        return Ok(());
-    };
-    if recovery_key.trim_start().starts_with('{') {
-        info!(
-            "MATRIX_RECOVERY_KEY looks like JSON; provide the secret storage recovery key string instead"
-        );
-    }
-    info!("MATRIX_RECOVERY_KEY set; attempting to import secrets from secret storage");
-    let secret_store: SecretStore = client
-        .encryption()
-        .secret_storage()
-        .open_secret_store(&recovery_key)
-        .await
-        .context("open secret storage with recovery key")?;
-    secret_store.import_secrets().await.context("import secrets from secret storage")?;
-    info!("recovery key import finished");
-    Ok(())
-}
-
-#[cfg(feature = "e2e-encryption")]
-async fn log_backup_state(client: &Client) {
-    let backups = client.encryption().backups();
-    let state = backups.state();
-    let enabled = backups.are_enabled().await;
-    let exists = backups.fetch_exists_on_server().await.unwrap_or(false);
-    info!(?state, enabled, exists_on_server = exists, "backup state summary");
-    if exists && !enabled {
-        info!(
-            "backup exists on the server but backups are not enabled; ensure the recovery key is available"
-        );
-    }
-}
-
-#[cfg(not(feature = "e2e-encryption"))]
-async fn log_backup_state(_client: &Client) {}
-
-#[cfg(feature = "e2e-encryption")]
-fn spawn_backup_diagnostics(client: Client, room_id: OwnedRoomId) {
-    let backup_client = client.clone();
-    tokio::spawn(async move {
-        let mut state_stream = backup_client.encryption().backups().state_stream();
-        while let Some(update) = state_stream.next().await {
-            match update {
-                Ok(state) => info!(?state, "backup state updated"),
-                Err(err) => info!(?err, "backup state stream error"),
-            }
-        }
-        info!("backup state stream closed");
-    });
-
-    tokio::spawn(async move {
-        let key_stream = client.encryption().backups().room_keys_for_room_stream(&room_id);
-        futures_util::pin_mut!(key_stream);
-        while let Some(update) = key_stream.next().await {
-            match update {
-                Ok(room_keys) => info!(?room_keys, "received room keys from backup"),
-                Err(err) => info!(?err, "room key backup stream error"),
-            }
-        }
-        info!("room key backup stream closed");
-    });
-}
-
-#[cfg(not(feature = "e2e-encryption"))]
-fn spawn_backup_diagnostics(_client: Client, _room_id: OwnedRoomId) {}
 
 #[cfg(feature = "e2ee-per-participant")]
 fn spawn_periodic_e2ee_key_resend(room: matrix_sdk::Room, context: PerParticipantE2eeContext) {
