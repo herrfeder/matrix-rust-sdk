@@ -606,7 +606,7 @@ fn recv_latest_zmq_message_parts(
         use zeromq::SocketRecv;
 
         let mut latest = match timeout(Duration::from_millis(100), socket.recv()).await {
-            Ok(Ok(message)) => message.into_vec(),
+            Ok(Ok(message)) => message.into_vec().into_iter().map(|b| b.to_vec()).collect(),
             Ok(Err(err)) => return Err(anyhow!(err).context("receive frame from ZMQ queue")),
             Err(_) => return Ok(None),
         };
@@ -615,7 +615,7 @@ fn recv_latest_zmq_message_parts(
         loop {
             match timeout(Duration::from_millis(1), socket.recv()).await {
                 Ok(Ok(message)) => {
-                    latest = message.into_vec();
+                    latest = message.into_vec().into_iter().map(|b| b.to_vec()).collect();
                     dropped_messages += 1;
                 }
                 Ok(Err(err)) => {
