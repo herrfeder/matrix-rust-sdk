@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use futures_util::StreamExt;
+use std::future::Future;
 use matrix_sdk::{Client, Room as MatrixRoom};
 use matrix_sdk_rtc::{
     LiveKitConnection, LiveKitConnector, LiveKitError, LiveKitResult, livekit_service_url,
@@ -256,6 +257,19 @@ pub enum LiveKitConnectionUpdate {
     Unchanged,
 }
 
+/// Handle a connection update and return the next driver state.
+pub async fn handle_connection_update<S, F, Fut>(
+    state: S,
+    update: LiveKitConnectionUpdate,
+    handler: &F,
+) -> LiveKitResult<S>
+where
+    F: Fn(S, LiveKitConnectionUpdate) -> Fut,
+    Fut: Future<Output = LiveKitResult<S>>,
+{
+    handler(state, update).await
+}
+
 /// Update an existing LiveKit connection based on room call memberships.
 pub async fn update_connection<T, O>(
     room: &matrix_sdk::Room,
@@ -300,20 +314,43 @@ where
     T: LiveKitTokenProvider,
     O: LiveKitRoomOptionsProvider,
 {
+    run_livekit_driver_with_handler(room, connector, service_url, (), |state, _update| async move {
+        Ok(state)
+    })
+    .await
+}
+
+/// Run the LiveKit room driver while delegating connection updates to a custom handler.
+pub async fn run_livekit_driver_with_handler<T, O, S, F, Fut>(
+    room: matrix_sdk::Room,
+    connector: &LiveKitSdkConnector<T, O>,
+    service_url: &str,
+    mut state: S,
+    handler: F,
+) -> LiveKitResult<S>
+where
+    T: LiveKitTokenProvider,
+    O: LiveKitRoomOptionsProvider,
+    F: Fn(S, LiveKitConnectionUpdate) -> Fut,
+    Fut: Future<Output = LiveKitResult<S>>,
+{
     let mut connection: Option<Arc<Room>> = None;
     let mut info_stream = room.subscribe_info();
 
-    let _ = update_connection(&room, connector, service_url, &room.clone_info(), &mut connection)
-        .await?;
+    let initial_update =
+        update_connection(&room, connector, service_url, &room.clone_info(), &mut connection)
+            .await?;
+    state = handle_connection_update(state, initial_update, &handler).await?;
 
     while let Some(room_info) = info_stream.next().await {
-        let _ =
+        let update =
             update_connection(&room, connector, service_url, &room_info, &mut connection).await?;
+        state = handle_connection_update(state, update, &handler).await?;
     }
 
     let _ = connection.take();
 
-    Ok(())
+    Ok(state)
 }
 
 #[async_trait]

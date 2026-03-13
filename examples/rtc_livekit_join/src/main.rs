@@ -35,9 +35,9 @@ use matrix_sdk_rtc_livekit::per_participant::{
     E2eeRoomOptionsProvider, PerParticipantE2eeContext,
 };
 use matrix_sdk_rtc_livekit::{
-    resolve_connection_details, update_connection as update_livekit_connection,
-    LiveKitConnectionUpdate, LiveKitRoomOptionsProvider, LiveKitSdkConnector, LiveKitTokenProvider,
-    Room, RoomOptions,
+    handle_connection_update as handle_livekit_connection_update, resolve_connection_details,
+    run_livekit_driver_with_handler, LiveKitConnectionUpdate, LiveKitRoomOptionsProvider,
+    LiveKitSdkConnector, LiveKitTokenProvider, Room, RoomOptions,
 };
 #[cfg(feature = "experimental-widgets")]
 use ruma::events::call::member::CallMemberStateKey;
@@ -84,7 +84,10 @@ fn v4l2_config_from_env() -> anyhow::Result<()> {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
+    run_rtc_livekit_join().await
+}
 
+async fn run_rtc_livekit_join() -> anyhow::Result<()> {
     let homeserver_url = required_env("HOMESERVER_URL")?;
     let username = required_env("MATRIX_USERNAME")?;
     let password = required_env("MATRIX_PASSWORD")?;
@@ -95,7 +98,7 @@ async fn main() -> anyhow::Result<()> {
     let v4l2_config = v4l2_config_from_env().context("read V4L2 config")?;
 
     let store_dir =
-        std::env::current_dir().context("read current directory")?.join("matrix-sdk-store");
+        env::current_dir().context("read current directory")?.join("matrix-sdk-store");
     if store_dir.is_file() {
         warn!(
             store_path = %store_dir.display(),
@@ -344,15 +347,22 @@ async fn main() -> anyhow::Result<()> {
         "starting LiveKit driver"
     );
     tokio::select! {
-        run_result = run_livekit_driver(
-            room,
-            connector,
-            service_url,
-            v4l2_config,
-            #[cfg(feature = "e2ee-per-participant")]
-            e2ee_context,
+        run_result = run_livekit_driver_with_handler(
+            room.clone(),
+            &connector,
+            &service_url,
+            build_driver_state(
+                room.clone(),
+                #[cfg(all(feature = "v4l2", target_os = "linux"))]
+                v4l2_config,
+                #[cfg(feature = "e2ee-per-participant")]
+                e2ee_context.clone(),
+            ),
+            |state, update| async move {
+                handle_livekit_connection_update(state, update, &handle_driver_connection_update).await
+            },
         ) => {
-            run_result.context("run LiveKit room driver")?;
+            let _ = run_result.context("run LiveKit room driver")?;
         }
         ctrlc_result = tokio::signal::ctrl_c() => {
             ctrlc_result.context("wait for ctrl+c")?;
@@ -673,56 +683,55 @@ fn register_room_message_key_probe_handler(
     client.event_handler_drop_guard(handle)
 }
 
-async fn run_livekit_driver<O>(
+struct DriverState {
     room: matrix_sdk::Room,
-    connector: LiveKitSdkConnector<EnvLiveKitTokenProvider, O>,
-    service_url: String,
-    v4l2_config: impl V4l2ConfigOption,
-    #[cfg(feature = "e2ee-per-participant")] e2ee_context: Option<PerParticipantE2eeContext>,
-) -> LiveKitResult<()>
-where
-    O: LiveKitRoomOptionsProvider,
-{
-    let mut connection: Option<std::sync::Arc<Room>> = None;
-    let mut info_stream = room.subscribe_info();
     #[cfg(all(feature = "v4l2", target_os = "linux"))]
-    let mut v4l2_publisher: Option<V4l2CameraPublisher> = None;
+    v4l2_config: Option<V4l2Config>,
+    #[cfg(all(feature = "v4l2", target_os = "linux"))]
+    v4l2_publisher: Option<V4l2CameraPublisher>,
+    #[cfg(feature = "e2ee-per-participant")]
+    e2ee_context: Option<PerParticipantE2eeContext>,
+}
 
-    handle_connection_update(
-        update_livekit_connection(
-            &room,
-            &connector,
-            &service_url,
-            &room.clone_info(),
-            &mut connection,
-        )
-        .await?,
-        &room,
-        &v4l2_config,
+fn build_driver_state(
+    room: matrix_sdk::Room,
+    #[cfg(all(feature = "v4l2", target_os = "linux"))] v4l2_config: Option<V4l2Config>,
+    #[cfg(feature = "e2ee-per-participant")] e2ee_context: Option<PerParticipantE2eeContext>,
+) -> DriverState {
+    DriverState {
+        room,
         #[cfg(all(feature = "v4l2", target_os = "linux"))]
-        &mut v4l2_publisher,
+        v4l2_config,
+        #[cfg(all(feature = "v4l2", target_os = "linux"))]
+        v4l2_publisher: None,
         #[cfg(feature = "e2ee-per-participant")]
-        &e2ee_context,
-    )
-    .await?;
-
-    while let Some(room_info) = info_stream.next().await {
-        handle_connection_update(
-            update_livekit_connection(&room, &connector, &service_url, &room_info, &mut connection)
-                .await?,
-            &room,
-            &v4l2_config,
-            #[cfg(all(feature = "v4l2", target_os = "linux"))]
-            &mut v4l2_publisher,
-            #[cfg(feature = "e2ee-per-participant")]
-            &e2ee_context,
-        )
-        .await?;
+        e2ee_context,
     }
+}
 
-    if connection.take().is_some() {
-        #[cfg(all(feature = "v4l2", target_os = "linux"))]
-        if let Some(publisher) = v4l2_publisher.take() {
+async fn set_video_stream_enabled(
+    state: &mut DriverState,
+    room_handle: Option<Arc<Room>>,
+    enabled: bool,
+) -> LiveKitResult<()> {
+    #[cfg(not(all(feature = "v4l2", target_os = "linux")))]
+    let _ = (&state, room_handle, enabled);
+
+    #[cfg(all(feature = "v4l2", target_os = "linux"))]
+    {
+        if enabled {
+            if state.v4l2_publisher.is_none() {
+                if let (Some(room_handle), Some(config)) =
+                    (room_handle, state.v4l2_config.as_ref().cloned())
+                {
+                    info!(device = %config.device, "starting V4L2 camera publisher");
+                    let publisher = V4l2CameraPublisher::start(room_handle, config)
+                        .await
+                        .map_err(|err| LiveKitError::connector(V4l2PublishError(err)))?;
+                    state.v4l2_publisher = Some(publisher);
+                }
+            }
+        } else if let Some(publisher) = state.v4l2_publisher.take() {
             publisher.stop().await.map_err(|err| LiveKitError::connector(V4l2PublishError(err)))?;
         }
     }
@@ -730,25 +739,19 @@ where
     Ok(())
 }
 
-async fn handle_connection_update(
+async fn handle_driver_connection_update(
+    mut state: DriverState,
     update: LiveKitConnectionUpdate,
-    room: &matrix_sdk::Room,
-    v4l2_config: &impl V4l2ConfigOption,
-    #[cfg(all(feature = "v4l2", target_os = "linux"))] v4l2_publisher: &mut Option<
-        V4l2CameraPublisher,
-    >,
-    #[cfg(feature = "e2ee-per-participant")] e2ee_context: &Option<PerParticipantE2eeContext>,
-) -> LiveKitResult<()> {
+) -> LiveKitResult<DriverState> {
     match update {
         LiveKitConnectionUpdate::Joined { room: room_handle, events } => {
-            info!(
-                room_name = %room_handle.name(),
-                "LiveKit room connected"
-            );
+            info!(room_name = %room_handle.name(), "LiveKit room connected");
             #[cfg(feature = "e2ee-per-participant")]
             let livekit_events = events;
+            #[cfg(not(feature = "e2ee-per-participant"))]
+            let _ = events;
             #[cfg(feature = "e2ee-per-participant")]
-            if let Some(context) = e2ee_context.as_ref() {
+            if let Some(context) = state.e2ee_context.as_ref() {
                 let identity = room_handle.local_participant().identity();
                 let key_set = context.key_provider.set_key(
                     &identity,
@@ -763,9 +766,13 @@ async fn handle_connection_update(
                     "enabled per-participant E2EE for local participant"
                 );
 
-                if let Err(err) =
-                    send_per_participant_keys(room, context.key_index, &context.local_key, None)
-                        .await
+                if let Err(err) = send_per_participant_keys(
+                    &state.room,
+                    context.key_index,
+                    &context.local_key,
+                    None,
+                )
+                .await
                 {
                     info!(
                         ?err,
@@ -786,48 +793,16 @@ async fn handle_connection_update(
                 }
 
                 if let Some(events) = livekit_events {
-                    spawn_livekit_e2ee_event_resend(room.clone(), events, context.clone());
+                    spawn_livekit_e2ee_event_resend(state.room.clone(), events, context.clone());
                 }
             }
-            #[cfg(all(feature = "v4l2", target_os = "linux"))]
-            if v4l2_publisher.is_none() {
-                if let Some(config) = v4l2_config.as_option().cloned() {
-                    info!(device = %config.device, "starting V4L2 camera publisher");
-                    let publisher =
-                        V4l2CameraPublisher::start(std::sync::Arc::clone(&room_handle), config)
-                            .await
-                            .map_err(|err| LiveKitError::connector(V4l2PublishError(err)))?;
-                    *v4l2_publisher = Some(publisher);
-                }
-            }
+            set_video_stream_enabled(&mut state, Some(room_handle), true).await?;
         }
-        LiveKitConnectionUpdate::Left =>
-        {
-            #[cfg(all(feature = "v4l2", target_os = "linux"))]
-            if let Some(publisher) = v4l2_publisher.take() {
-                publisher
-                    .stop()
-                    .await
-                    .map_err(|err| LiveKitError::connector(V4l2PublishError(err)))?;
-            }
+        LiveKitConnectionUpdate::Left => {
+            set_video_stream_enabled(&mut state, None, false).await?;
         }
         LiveKitConnectionUpdate::Unchanged => {}
     }
 
-    Ok(())
+    Ok(state)
 }
-
-trait V4l2ConfigOption {
-    #[cfg(all(feature = "v4l2", target_os = "linux"))]
-    fn as_option(&self) -> Option<&V4l2Config>;
-}
-
-#[cfg(all(feature = "v4l2", target_os = "linux"))]
-impl V4l2ConfigOption for Option<V4l2Config> {
-    fn as_option(&self) -> Option<&V4l2Config> {
-        self.as_ref()
-    }
-}
-
-#[cfg(not(all(feature = "v4l2", target_os = "linux")))]
-impl V4l2ConfigOption for () {}
