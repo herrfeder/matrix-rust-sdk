@@ -815,8 +815,11 @@ fn rgb_to_i420(
             let u_value = (-0.148 * r - 0.291 * g + 0.439 * b + 128.0).round().clamp(0.0, 255.0);
             let v_value = (0.439 * r - 0.368 * g - 0.071 * b + 128.0).round().clamp(0.0, 255.0);
 
-            dst_u_row[x] = u_value as u8;
-            dst_v_row[x] = v_value as u8;
+            // NOTE: WebRTC I420 buffer chroma ordering in this pipeline maps
+            // these channels inversely compared to our initial JPEG conversion.
+            // Writing V into U and U into V fixes red/blue inversion.
+            dst_u_row[x] = v_value as u8;
+            dst_v_row[x] = u_value as u8;
         }
     }
 }
