@@ -292,7 +292,7 @@ async fn run_rtc_livekit_join() -> anyhow::Result<RtcLiveKitRuntime> {
         register_e2ee_to_device_handler(
             &client,
             room.room_id().to_owned(),
-            std::sync::Arc::clone(&context.key_provider),
+            Arc::clone(&context.key_provider),
         )
     });
     #[cfg(feature = "e2ee-per-participant")]
@@ -704,7 +704,7 @@ async fn set_video_stream_enabled(
                     state.v4l2_publisher = Some(publisher);
                 }
             }
-        } else if let Some(publisher) = state.v4l2_publisher.take() {
+        } else if let Some(mut publisher) = state.v4l2_publisher.take() {
             publisher.stop().await.map_err(|err| LiveKitError::connector(V4l2PublishError(err)))?;
         }
     }
