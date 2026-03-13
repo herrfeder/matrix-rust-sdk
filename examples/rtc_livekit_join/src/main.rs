@@ -416,6 +416,10 @@ impl RtcLiveKitRuntime {
     }
 
     async fn shutdown(self) {
+        if let Err(err) = self.set_call_active(false).await {
+            info!(?err, "failed to deactivate call while shutting down runtime");
+        }
+
         self.sync_handle.abort();
         self.driver_handle.abort();
 

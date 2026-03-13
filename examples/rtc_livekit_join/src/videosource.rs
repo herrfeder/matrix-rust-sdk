@@ -86,10 +86,7 @@ enum ZmqPayloadEncoding {
 
 #[cfg(all(feature = "v4l2", target_os = "linux"))]
 impl V4l2CameraPublisher {
-    pub(crate) async fn start(
-        room: Arc<Room>,
-        config: V4l2Config,
-    ) -> anyhow::Result<Self> {
+    pub(crate) async fn start(room: Arc<Room>, config: V4l2Config) -> anyhow::Result<Self> {
         use matrix_sdk_rtc_livekit::livekit::options::{TrackPublishOptions, VideoCodec};
         use matrix_sdk_rtc_livekit::livekit::track::{LocalTrack, TrackSource};
         use matrix_sdk_rtc_livekit::livekit::webrtc::prelude::RtcVideoSource;
@@ -160,6 +157,15 @@ impl V4l2CameraPublisher {
             .await
             .context("unpublish V4L2 camera track")?;
         Ok(())
+    }
+}
+
+#[cfg(all(feature = "v4l2", target_os = "linux"))]
+impl Drop for V4l2CameraPublisher {
+    fn drop(&mut self) {
+        let _ = self.stop_tx.send(());
+        self.stdin_overlay_task.abort();
+        self.task.abort();
     }
 }
 
