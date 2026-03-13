@@ -72,6 +72,7 @@ enum ZmqPixelFormat {
     #[default]
     Nv12,
     Yuyv,
+    Jpeg,
 }
 
 #[cfg(all(feature = "v4l2", target_os = "linux"))]
@@ -416,8 +417,9 @@ fn run_zmq_capture_loop(
     let height = resolution.height as usize;
     let expected_i420_size = width * height * 3 / 2;
     let expected_size = match pixel_format {
-        ZmqPixelFormat::I420 | ZmqPixelFormat::Nv12 => expected_i420_size,
-        ZmqPixelFormat::Yuyv => width * height * 2,
+        ZmqPixelFormat::I420 | ZmqPixelFormat::Nv12 => Some(expected_i420_size),
+        ZmqPixelFormat::Yuyv => Some(width * height * 2),
+        ZmqPixelFormat::Jpeg => None,
     };
 
     let mut frame = VideoFrame {
@@ -450,21 +452,26 @@ fn run_zmq_capture_loop(
 
         let payload = payload_parts
             .iter()
-            .find(|part| part.len() == expected_size)
+            .find(|part| match expected_size {
+                Some(size) => part.len() == size,
+                None => is_probably_jpeg(part),
+            })
             .or_else(|| payload_parts.last());
 
         let Some(payload) = payload else {
             continue;
         };
 
-        if payload.len() != expected_size {
-            warn!(
-                payload_len = payload.len(),
-                expected_size,
-                num_parts = payload_parts.len(),
-                "dropping ZMQ frame with unexpected size for configured pixel format"
-            );
-            continue;
+        if let Some(expected_size) = expected_size {
+            if payload.len() != expected_size {
+                warn!(
+                    payload_len = payload.len(),
+                    expected_size,
+                    num_parts = payload_parts.len(),
+                    "dropping ZMQ frame with unexpected size for configured pixel format"
+                );
+                continue;
+            }
         }
 
         let (stride_y, stride_u, stride_v) = frame.buffer.strides();
@@ -512,7 +519,7 @@ fn run_zmq_capture_loop(
             }
             ZmqPixelFormat::Yuyv => {
                 yuyv_to_i420(
-                    &payload,
+                    payload,
                     width,
                     width * 2,
                     height,
@@ -523,6 +530,18 @@ fn run_zmq_capture_loop(
                     dst_v,
                     stride_v,
                 );
+            }
+            ZmqPixelFormat::Jpeg => {
+                decode_jpeg_to_i420(
+                    payload,
+                    &resolution,
+                    dst_y,
+                    stride_y,
+                    dst_u,
+                    stride_u,
+                    dst_v,
+                    stride_v,
+                )?;
             }
         }
 
@@ -544,6 +563,130 @@ fn copy_plane(src: &[u8], width: usize, height: usize, dst: &mut [u8], dst_strid
         let src_start = row * width;
         let dst_start = row * dst_stride;
         dst[dst_start..dst_start + width].copy_from_slice(&src[src_start..src_start + width]);
+    }
+}
+
+#[cfg(all(feature = "v4l2", target_os = "linux"))]
+fn is_probably_jpeg(data: &[u8]) -> bool {
+    data.len() >= 4 && data.starts_with(&[0xFF, 0xD8]) && data.ends_with(&[0xFF, 0xD9])
+}
+
+#[cfg(all(feature = "v4l2", target_os = "linux"))]
+fn decode_jpeg_to_i420(
+    jpeg_payload: &[u8],
+    resolution: &matrix_sdk_rtc_livekit::livekit::webrtc::prelude::VideoResolution,
+    dst_y: &mut [u8],
+    stride_y: u32,
+    dst_u: &mut [u8],
+    stride_u: u32,
+    dst_v: &mut [u8],
+    stride_v: u32,
+) -> anyhow::Result<()> {
+    use jpeg_decoder::{Decoder as JpegDecoder, PixelFormat};
+
+    let mut decoder = JpegDecoder::new(std::io::Cursor::new(jpeg_payload));
+    let decoded = decoder.decode().context("decode JPEG payload from ZMQ queue")?;
+    let info = decoder.info().context("read JPEG info from ZMQ queue")?;
+
+    let src_width = info.width as usize;
+    let src_height = info.height as usize;
+    let dst_width = resolution.width as usize;
+    let dst_height = resolution.height as usize;
+
+    if src_width != dst_width || src_height != dst_height {
+        return Err(anyhow!(
+            "JPEG frame size {}x{} does not match configured output {}x{}",
+            src_width,
+            src_height,
+            dst_width,
+            dst_height
+        ));
+    }
+
+    let rgb = match info.pixel_format {
+        PixelFormat::RGB24 => decoded,
+        PixelFormat::L8 => {
+            let mut rgb = Vec::with_capacity(src_width * src_height * 3);
+            for y in decoded {
+                rgb.push(y);
+                rgb.push(y);
+                rgb.push(y);
+            }
+            rgb
+        }
+        other => {
+            return Err(anyhow!("unsupported JPEG pixel format {:?}; expected RGB24 or L8", other));
+        }
+    };
+
+    rgb_to_i420(
+        &rgb,
+        dst_width,
+        dst_height,
+        dst_y,
+        stride_y as usize,
+        dst_u,
+        stride_u as usize,
+        dst_v,
+        stride_v as usize,
+    );
+    Ok(())
+}
+
+#[cfg(all(feature = "v4l2", target_os = "linux"))]
+fn rgb_to_i420(
+    src_rgb: &[u8],
+    width: usize,
+    height: usize,
+    dst_y: &mut [u8],
+    dst_stride_y: usize,
+    dst_u: &mut [u8],
+    dst_stride_u: usize,
+    dst_v: &mut [u8],
+    dst_stride_v: usize,
+) {
+    for y in 0..height {
+        let src_row = &src_rgb[y * width * 3..(y + 1) * width * 3];
+        let dst_y_row = &mut dst_y[y * dst_stride_y..(y + 1) * dst_stride_y];
+        for x in 0..width {
+            let r = src_row[x * 3] as f32;
+            let g = src_row[x * 3 + 1] as f32;
+            let b = src_row[x * 3 + 2] as f32;
+            let y_value = (0.257 * r + 0.504 * g + 0.098 * b + 16.0).round().clamp(0.0, 255.0);
+            dst_y_row[x] = y_value as u8;
+        }
+    }
+
+    for y in 0..(height / 2) {
+        let dst_u_row = &mut dst_u[y * dst_stride_u..(y + 1) * dst_stride_u];
+        let dst_v_row = &mut dst_v[y * dst_stride_v..(y + 1) * dst_stride_v];
+
+        for x in 0..(width / 2) {
+            let mut r_sum = 0.0f32;
+            let mut g_sum = 0.0f32;
+            let mut b_sum = 0.0f32;
+
+            for dy in 0..2 {
+                for dx in 0..2 {
+                    let sx = x * 2 + dx;
+                    let sy = y * 2 + dy;
+                    let base = (sy * width + sx) * 3;
+                    r_sum += src_rgb[base] as f32;
+                    g_sum += src_rgb[base + 1] as f32;
+                    b_sum += src_rgb[base + 2] as f32;
+                }
+            }
+
+            let r = r_sum / 4.0;
+            let g = g_sum / 4.0;
+            let b = b_sum / 4.0;
+
+            let u_value = (-0.148 * r - 0.291 * g + 0.439 * b + 128.0).round().clamp(0.0, 255.0);
+            let v_value = (0.439 * r - 0.368 * g - 0.071 * b + 128.0).round().clamp(0.0, 255.0);
+
+            dst_u_row[x] = u_value as u8;
+            dst_v_row[x] = v_value as u8;
+        }
     }
 }
 
@@ -635,9 +778,10 @@ fn zmq_pixel_format_from_env() -> anyhow::Result<ZmqPixelFormat> {
         None | Some("nv12") => Ok(ZmqPixelFormat::Nv12),
         Some("i420") => Ok(ZmqPixelFormat::I420),
         Some("yuyv") => Ok(ZmqPixelFormat::Yuyv),
-        Some(other) => {
-            Err(anyhow!("invalid V4L2_ZMQ_PIXEL_FORMAT '{other}'; expected nv12|i420|yuyv"))
-        }
+        Some("jpeg") | Some("jpg") => Ok(ZmqPixelFormat::Jpeg),
+        Some(other) => Err(anyhow!(
+            "invalid V4L2_ZMQ_PIXEL_FORMAT '{other}'; expected nv12|i420|yuyv|jpeg|jpg"
+        )),
     }
 }
 

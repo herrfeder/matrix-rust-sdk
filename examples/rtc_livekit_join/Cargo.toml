@@ -35,6 +35,7 @@ uuid.workspace = true
 v4l = { version = "0.14", optional = true }
 rand = { version = "0.8.0" }
 zeromq = { version = "0.4", default-features = false, features = ["tcp-transport", "tokio-runtime"] }
+jpeg-decoder = "0.3"
 
 [lints]
 workspace = true
