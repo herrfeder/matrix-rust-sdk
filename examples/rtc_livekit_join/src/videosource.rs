@@ -6,7 +6,7 @@ use anyhow::{anyhow, Context};
 #[cfg(all(feature = "v4l2", target_os = "linux"))]
 use matrix_sdk_rtc_livekit::Room;
 #[cfg(all(feature = "v4l2", target_os = "linux"))]
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 #[cfg(all(feature = "v4l2", target_os = "linux"))]
 use crate::{
@@ -76,6 +76,15 @@ enum ZmqPixelFormat {
 }
 
 #[cfg(all(feature = "v4l2", target_os = "linux"))]
+#[derive(Copy, Clone, Debug, Default)]
+enum ZmqPayloadEncoding {
+    #[default]
+    Auto,
+    Raw,
+    Base64,
+}
+
+#[cfg(all(feature = "v4l2", target_os = "linux"))]
 impl V4l2CameraPublisher {
     pub(crate) async fn start(
         room: std::sync::Arc<Room>,
@@ -124,14 +133,17 @@ impl V4l2CameraPublisher {
             V4l2CaptureMode::TestRedFrames => {
                 run_generated_red_capture_loop(resolution, rtc_source, stop_rx)
             }
-            V4l2CaptureMode::ZmqQueue { endpoint, pixel_format } => run_zmq_capture_loop(
-                resolution,
-                rtc_source,
-                stop_rx,
-                endpoint,
-                pixel_format,
-                text_overlay,
-            ),
+            V4l2CaptureMode::ZmqQueue { endpoint, pixel_format, payload_encoding } => {
+                run_zmq_capture_loop(
+                    resolution,
+                    rtc_source,
+                    stop_rx,
+                    endpoint,
+                    pixel_format,
+                    payload_encoding,
+                    text_overlay,
+                )
+            }
         });
 
         Ok(Self { room, track, stop_tx, task, stdin_overlay_task })
@@ -153,9 +165,16 @@ impl V4l2CameraPublisher {
 
 #[cfg(all(feature = "v4l2", target_os = "linux"))]
 enum V4l2CaptureMode {
-    Camera { device: v4l::Device, pixel_format: V4l2PixelFormat },
+    Camera {
+        device: v4l::Device,
+        pixel_format: V4l2PixelFormat,
+    },
     TestRedFrames,
-    ZmqQueue { endpoint: String, pixel_format: ZmqPixelFormat },
+    ZmqQueue {
+        endpoint: String,
+        pixel_format: ZmqPixelFormat,
+        payload_encoding: ZmqPayloadEncoding,
+    },
 }
 
 #[cfg(all(feature = "v4l2", target_os = "linux"))]
@@ -189,18 +208,24 @@ fn configure_v4l2_capture_mode(
         let resolution = VideoResolution { width, height };
         let rtc_source = NativeVideoSource::new(resolution.clone(), true);
         let pixel_format = zmq_pixel_format_from_env()?;
+        let payload_encoding = zmq_payload_encoding_from_env()?;
         info!(
             width = resolution.width,
             height = resolution.height,
             endpoint = %config.device,
             framerate = ZMQ_SOURCE_FRAMERATE,
             pixel_format = ?pixel_format,
+            payload_encoding = ?payload_encoding,
             "configured ZMQ queue video source"
         );
         return Ok((
             resolution,
             rtc_source,
-            V4l2CaptureMode::ZmqQueue { endpoint: config.device.clone(), pixel_format },
+            V4l2CaptureMode::ZmqQueue {
+                endpoint: config.device.clone(),
+                pixel_format,
+                payload_encoding,
+            },
         ));
     }
 
@@ -392,6 +417,7 @@ fn run_zmq_capture_loop(
     stop_rx: std::sync::mpsc::Receiver<()>,
     endpoint: String,
     pixel_format: ZmqPixelFormat,
+    payload_encoding: ZmqPayloadEncoding,
     text_overlay: Arc<Mutex<TextOverlayState>>,
 ) -> anyhow::Result<()> {
     use matrix_sdk_rtc_livekit::livekit::webrtc::prelude::{I420Buffer, VideoFrame, VideoRotation};
@@ -421,6 +447,15 @@ fn run_zmq_capture_loop(
         ZmqPixelFormat::Yuyv => Some(width * height * 2),
         ZmqPixelFormat::Jpeg => None,
     };
+    debug!(
+        endpoint = %endpoint,
+        ?pixel_format,
+        ?payload_encoding,
+        ?expected_size,
+        width,
+        height,
+        "starting ZMQ capture loop"
+    );
 
     let mut frame = VideoFrame {
         rotation: VideoRotation::VideoRotation0,
@@ -450,17 +485,29 @@ fn run_zmq_capture_loop(
             None => continue,
         };
 
-        let payload = payload_parts
-            .iter()
-            .find(|part| match expected_size {
-                Some(size) => part.len() == size,
-                None => is_probably_jpeg(part),
-            })
-            .or_else(|| payload_parts.last());
+        debug!(
+            num_parts = payload_parts.len(),
+            part_sizes = ?payload_parts.iter().map(|p| p.len()).collect::<Vec<_>>(),
+            "received ZMQ message"
+        );
+
+        let selected_idx = payload_parts.iter().position(|part| match expected_size {
+            Some(size) => part.len() == size,
+            None => is_probably_jpeg(part),
+        });
+        let payload =
+            selected_idx.and_then(|idx| payload_parts.get(idx)).or_else(|| payload_parts.last());
 
         let Some(payload) = payload else {
+            debug!("dropping empty ZMQ multipart message");
             continue;
         };
+
+        debug!(
+            selected_part = ?selected_idx,
+            selected_payload_len = payload.len(),
+            "selected ZMQ payload part"
+        );
 
         if let Some(expected_size) = expected_size {
             if payload.len() != expected_size {
@@ -532,8 +579,9 @@ fn run_zmq_capture_loop(
                 );
             }
             ZmqPixelFormat::Jpeg => {
-                decode_jpeg_to_i420(
+                decode_zmq_jpeg_payload_to_i420(
                     payload,
+                    payload_encoding,
                     &resolution,
                     dst_y,
                     stride_y,
@@ -569,6 +617,61 @@ fn copy_plane(src: &[u8], width: usize, height: usize, dst: &mut [u8], dst_strid
 #[cfg(all(feature = "v4l2", target_os = "linux"))]
 fn is_probably_jpeg(data: &[u8]) -> bool {
     data.len() >= 4 && data.starts_with(&[0xFF, 0xD8]) && data.ends_with(&[0xFF, 0xD9])
+}
+
+#[cfg(all(feature = "v4l2", target_os = "linux"))]
+fn decode_zmq_jpeg_payload_to_i420(
+    payload: &[u8],
+    payload_encoding: ZmqPayloadEncoding,
+    resolution: &matrix_sdk_rtc_livekit::livekit::webrtc::prelude::VideoResolution,
+    dst_y: &mut [u8],
+    stride_y: u32,
+    dst_u: &mut [u8],
+    stride_u: u32,
+    dst_v: &mut [u8],
+    stride_v: u32,
+) -> anyhow::Result<()> {
+    match payload_encoding {
+        ZmqPayloadEncoding::Raw => decode_jpeg_to_i420(
+            payload, resolution, dst_y, stride_y, dst_u, stride_u, dst_v, stride_v,
+        ),
+        ZmqPayloadEncoding::Base64 => {
+            let decoded = decode_base64_payload(payload)?;
+            decode_jpeg_to_i420(
+                &decoded, resolution, dst_y, stride_y, dst_u, stride_u, dst_v, stride_v,
+            )
+        }
+        ZmqPayloadEncoding::Auto => {
+            if is_probably_jpeg(payload)
+                && decode_jpeg_to_i420(
+                    payload, resolution, dst_y, stride_y, dst_u, stride_u, dst_v, stride_v,
+                )
+                .is_ok()
+            {
+                return Ok(());
+            }
+            let decoded = decode_base64_payload(payload)
+                .context("decode base64 JPEG payload from ZMQ queue (auto mode)")?;
+            decode_jpeg_to_i420(
+                &decoded, resolution, dst_y, stride_y, dst_u, stride_u, dst_v, stride_v,
+            )
+        }
+    }
+}
+
+#[cfg(all(feature = "v4l2", target_os = "linux"))]
+fn decode_base64_payload(payload: &[u8]) -> anyhow::Result<Vec<u8>> {
+    use base64::{engine::general_purpose::STANDARD, Engine};
+
+    let payload_str = std::str::from_utf8(payload).context("payload is not UTF-8 base64 text")?;
+    let trimmed = payload_str.trim();
+    let decoded = STANDARD.decode(trimmed).context("base64 decode payload from ZMQ queue")?;
+    debug!(
+        encoded_len = payload.len(),
+        decoded_len = decoded.len(),
+        "decoded base64 payload from ZMQ queue"
+    );
+    Ok(decoded)
 }
 
 #[cfg(all(feature = "v4l2", target_os = "linux"))]
@@ -782,6 +885,22 @@ fn zmq_pixel_format_from_env() -> anyhow::Result<ZmqPixelFormat> {
         Some(other) => Err(anyhow!(
             "invalid V4L2_ZMQ_PIXEL_FORMAT '{other}'; expected nv12|i420|yuyv|jpeg|jpg"
         )),
+    }
+}
+
+#[cfg(all(feature = "v4l2", target_os = "linux"))]
+fn zmq_payload_encoding_from_env() -> anyhow::Result<ZmqPayloadEncoding> {
+    match optional_env("V4L2_ZMQ_PAYLOAD_ENCODING")
+        .as_deref()
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        None | Some("auto") => Ok(ZmqPayloadEncoding::Auto),
+        Some("raw") => Ok(ZmqPayloadEncoding::Raw),
+        Some("base64") => Ok(ZmqPayloadEncoding::Base64),
+        Some(other) => {
+            Err(anyhow!("invalid V4L2_ZMQ_PAYLOAD_ENCODING '{other}'; expected auto|raw|base64"))
+        }
     }
 }
 

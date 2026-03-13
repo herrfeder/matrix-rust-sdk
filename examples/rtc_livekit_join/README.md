@@ -82,8 +82,9 @@ cargo run -p example-rtc-livekit-join --features v4l2
 To publish frames from a ZeroMQ queue instead of a local camera, set
 `V4L2_VIDEO_SOURCE=zmq` and provide the source address through
 `V4L2_ZMQ_IP` and `V4L2_ZMQ_PORT`. You can also set
-`V4L2_ZMQ_PIXEL_FORMAT` (`nv12` default, or `i420` / `yuyv` / `jpeg`). The consumer
-uses the framerate configured in code (`ZMQ_SOURCE_FRAMERATE` in
+`V4L2_ZMQ_PIXEL_FORMAT` (`nv12` default, or `i420` / `yuyv` / `jpeg`) and
+optionally `V4L2_ZMQ_PAYLOAD_ENCODING` (`auto` default, `raw`, `base64`). The
+consumer uses the framerate configured in code (`ZMQ_SOURCE_FRAMERATE` in
 `videosource.rs`):
 
 ```bash
@@ -97,6 +98,7 @@ V4L2_VIDEO_SOURCE=zmq \
 V4L2_ZMQ_IP=127.0.0.1 \
 V4L2_ZMQ_PORT=5555 \
 V4L2_ZMQ_PIXEL_FORMAT=jpeg \
+V4L2_ZMQ_PAYLOAD_ENCODING=base64 \
 V4L2_WIDTH=1280 \
 V4L2_HEIGHT=720 \
 RUST_LOG=info \
@@ -131,6 +133,9 @@ Notes:
   `V4L2_WIDTH`/`V4L2_HEIGHT` (defaults to 640x480).
   `V4L2_ZMQ_PIXEL_FORMAT` controls interpretation: `nv12` (default), `i420`,
   `yuyv`, or `jpeg`/`jpg`.
+- `V4L2_ZMQ_PAYLOAD_ENCODING` controls whether JPEG payloads are interpreted
+  as raw bytes (`raw`), base64-encoded text (`base64`), or auto-detected
+  (`auto`, default).
 - In `jpeg` mode, each frame payload must be a decodable JPEG image with
   dimensions matching `V4L2_WIDTH`/`V4L2_HEIGHT`.
 - ZMQ publish pacing is configured in code via `ZMQ_SOURCE_FRAMERATE` in
