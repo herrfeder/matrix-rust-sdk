@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use futures_util::StreamExt;
-use futures_util::future::BoxFuture;
+use std::future::Future;
 use matrix_sdk::{Client, Room as MatrixRoom};
 use matrix_sdk_rtc::{
     LiveKitConnection, LiveKitConnector, LiveKitError, LiveKitResult, livekit_service_url,
@@ -258,13 +258,14 @@ pub enum LiveKitConnectionUpdate {
 }
 
 /// Handle a connection update and return the next driver state.
-pub async fn handle_connection_update<S, F>(
+pub async fn handle_connection_update<S, F, Fut>(
     state: S,
     update: LiveKitConnectionUpdate,
     handler: &F,
 ) -> LiveKitResult<S>
 where
-    F: for<'a> Fn(S, LiveKitConnectionUpdate) -> BoxFuture<'a, LiveKitResult<S>>,
+    F: Fn(S, LiveKitConnectionUpdate) -> Fut,
+    Fut: Future<Output = LiveKitResult<S>>,
 {
     handler(state, update).await
 }
@@ -313,14 +314,14 @@ where
     T: LiveKitTokenProvider,
     O: LiveKitRoomOptionsProvider,
 {
-    run_livekit_driver_with_handler(room, connector, service_url, (), |state, _update| {
-        Box::pin(async move { Ok(state) })
+    run_livekit_driver_with_handler(room, connector, service_url, (), |state, _update| async move {
+        Ok(state)
     })
     .await
 }
 
 /// Run the LiveKit room driver while delegating connection updates to a custom handler.
-pub async fn run_livekit_driver_with_handler<T, O, S, F>(
+pub async fn run_livekit_driver_with_handler<T, O, S, F, Fut>(
     room: matrix_sdk::Room,
     connector: &LiveKitSdkConnector<T, O>,
     service_url: &str,
@@ -330,7 +331,8 @@ pub async fn run_livekit_driver_with_handler<T, O, S, F>(
 where
     T: LiveKitTokenProvider,
     O: LiveKitRoomOptionsProvider,
-    F: for<'a> Fn(S, LiveKitConnectionUpdate) -> BoxFuture<'a, LiveKitResult<S>>,
+    F: Fn(S, LiveKitConnectionUpdate) -> Fut,
+    Fut: Future<Output = LiveKitResult<S>>,
 {
     let mut connection: Option<Arc<Room>> = None;
     let mut info_stream = room.subscribe_info();

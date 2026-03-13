@@ -4,23 +4,23 @@
 use std::sync::{Arc, Mutex};
 use std::{env, fs};
 
-use anyhow::{Context, anyhow};
+use anyhow::{anyhow, Context};
 #[cfg(any(feature = "e2ee-per-participant", feature = "e2e-encryption"))]
 use futures_util::StreamExt;
 #[cfg(feature = "e2e-encryption")]
 use matrix_sdk::encryption::secret_storage::SecretStore;
 use matrix_sdk::{
-    Client, RoomState,
     config::SyncSettings,
     event_handler::EventHandlerDropGuard,
     ruma::{OwnedRoomId, OwnedServerName, RoomId, RoomOrAliasId, ServerName},
+    Client, RoomState,
 };
 #[cfg(feature = "experimental-widgets")]
 use matrix_sdk::{
     ruma::{DeviceId, UserId},
     widget::{
-        ClientProperties, ElementCallWidget, ElementCallWidgetOptions, EncryptionSystem, Intent,
         element_call_member_content, element_call_send_event_message, start_element_call_widget,
+        ClientProperties, ElementCallWidget, ElementCallWidgetOptions, EncryptionSystem, Intent,
     },
 };
 #[cfg(all(feature = "v4l2", target_os = "linux"))]
@@ -30,14 +30,14 @@ use matrix_sdk_rtc::{LiveKitConnector, LiveKitResult};
 use matrix_sdk_rtc_livekit::livekit::id::ParticipantIdentity;
 #[cfg(feature = "e2ee-per-participant")]
 use matrix_sdk_rtc_livekit::per_participant::{
-    E2eeRoomOptionsProvider, PerParticipantE2eeContext, build_per_participant_e2ee,
-    per_participant_key_grace_period_from_env, register_e2ee_to_device_handler,
-    send_per_participant_keys, spawn_livekit_e2ee_event_resend,
+    build_per_participant_e2ee, per_participant_key_grace_period_from_env,
+    register_e2ee_to_device_handler, send_per_participant_keys, spawn_livekit_e2ee_event_resend,
+    E2eeRoomOptionsProvider, PerParticipantE2eeContext,
 };
 use matrix_sdk_rtc_livekit::{
-    LiveKitConnectionUpdate, LiveKitRoomOptionsProvider, LiveKitSdkConnector, LiveKitTokenProvider,
-    Room, RoomOptions, handle_connection_update as handle_livekit_connection_update,
-    resolve_connection_details, run_livekit_driver_with_handler,
+    handle_connection_update as handle_livekit_connection_update, resolve_connection_details,
+    run_livekit_driver_with_handler, LiveKitConnectionUpdate, LiveKitRoomOptionsProvider,
+    LiveKitSdkConnector, LiveKitTokenProvider, Room, RoomOptions,
 };
 #[cfg(feature = "experimental-widgets")]
 use ruma::events::call::member::CallMemberStateKey;
@@ -74,7 +74,7 @@ impl LiveKitRoomOptionsProvider for DefaultRoomOptionsProvider {
 #[cfg(all(feature = "v4l2", target_os = "linux"))]
 mod videosource;
 #[cfg(all(feature = "v4l2", target_os = "linux"))]
-use videosource::{V4l2CameraPublisher, V4l2Config, V4l2PublishError, v4l2_config_from_env};
+use videosource::{v4l2_config_from_env, V4l2CameraPublisher, V4l2Config, V4l2PublishError};
 
 #[cfg(not(all(feature = "v4l2", target_os = "linux")))]
 fn v4l2_config_from_env() -> anyhow::Result<()> {
@@ -358,9 +358,9 @@ async fn run_rtc_livekit_join() -> anyhow::Result<()> {
                 #[cfg(feature = "e2ee-per-participant")]
                 e2ee_context.clone(),
             ),
-            |state, update| Box::pin(async move {
+            |state, update| async move {
                 handle_livekit_connection_update(state, update, &handle_driver_connection_update).await
-            }),
+            },
         ) => {
             let _ = run_result.context("run LiveKit room driver")?;
         }
