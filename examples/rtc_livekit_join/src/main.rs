@@ -1,5 +1,48 @@
 #![recursion_limit = "256"]
 
+#[derive(Clone)]
+pub struct AppState {
+    pub matrix_client: Client,
+}
+
+use once_cell::sync::Lazy;
+use serde::Deserialize;
+use std::fs;
+use std::sync::OnceLock;
+
+use once_cell::sync::Lazy;
+use std::collections::HashMap;
+use std::fs;
+use serde::Deserialize;
+
+#[derive(Debug, Deserialize)]
+pub struct MappingEntry {
+    pub object: String,
+    pub order: String
+}
+
+#[derive(Debug, Deserialize)]
+struct MappingFile {
+    mappings: HashMap<String, MappingEntry>,
+}
+
+pub static INPUTMAPPING: Lazy<HashMap<String, MappingEntry>> = Lazy::new(|| {
+    let json_str = fs::read_to_string("inputmapping.json")
+        .expect("Failed to read JSON file");
+    let parsed: MappingFile = serde_json::from_str(&json_str)
+        .expect("Failed to parse JSON into mapping structure");
+    parsed.mappings
+});
+
+pub fn get_object(input: &str) -> Option<&str> {
+    INPUTMAPPING.get(input).map(|entry| entry.object.as_str())
+}
+
+pub fn get_order(input: &str) -> Option<&str> {
+    INPUTMAPPING.get(input).map(|entry| entry.order.as_str())
+}
+
+
 #[cfg(any(feature = "experimental-widgets", all(feature = "v4l2", target_os = "linux")))]
 use std::sync::{Arc, Mutex};
 use std::{env, fs};
@@ -81,22 +124,38 @@ fn v4l2_config_from_env() -> anyhow::Result<()> {
     Ok(())
 }
 
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
 
+    Ok(())
+}    
+
+
     let rtc = run_rtc_livekit_join().await?;
     rtc.set_call_active(true).await?;
 
-    tokio::signal::ctrl_c().await.context("wait for ctrl+c")?;
-    info!("received ctrl+c; shutting down rtc client");
+    //tokio::signal::ctrl_c().await.context("wait for ctrl+c")?;
+   // info!("received ctrl+c; shutting down rtc client");
 
+    thread::sleep(Duration::from_secs(10));
     rtc.set_call_active(false).await?;
     rtc.shutdown().await;
 
-    info!("ctrl+c shutdown flow finished; exiting process");
-    Ok(())
-}
+    thread::sleep(Duration::from_secs(10));
+
+    let rtc = run_rtc_livekit_join().await?;
+    rtc.set_call_active(true).await?;
+
+    //tokio::signal::ctrl_c().await.context("wait for ctrl+c")?;
+    //info!("received ctrl+c; shutting down rtc client");
+
+    thread::sleep(Duration::from_secs(10));
+    rtc.set_call_active(false).await?;
+    rtc.shutdown().await;
+
+
 
 async fn run_rtc_livekit_join() -> anyhow::Result<RtcLiveKitRuntime> {
     let homeserver_url = required_env("HOMESERVER_URL")?;
