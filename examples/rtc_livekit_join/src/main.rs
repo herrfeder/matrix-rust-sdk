@@ -2,11 +2,8 @@
 
 // Stuff from Matrix Bot
 
-#[derive(Clone)]
-pub struct AppState {
-    pub matrix_client: Client,
-}
-
+mod AppState;
+use crate::AppState::AppState;
 use std::{env, fs};
 use once_cell::sync::Lazy;
 use std::sync::OnceLock;
@@ -37,7 +34,6 @@ pub static BOTCONFIG: Lazy<Config> = Lazy::new(|| {
 
 mod BotConfig;
 mod InputMapping;
-mod AppState;
 
 use reqwest;
 use url::Url;
@@ -81,17 +77,16 @@ pub fn get_order(input: &str) -> Option<&str> {
 
 use std::borrow::ToOwned;
 
+#[cfg(feature = "e2e-encryption")]
 use matrix_sdk::{
     config::SyncSettings,
-    room::Room,
-    ruma::events::room::message::RoomMessageEventContent,
-    Client,
-    RoomState,
+    event_handler::EventHandlerDropGuard,
+    ruma::{OwnedRoomId, OwnedServerName, RoomId, RoomOrAliasId, ServerName},
+    Client, RoomState,
 };
 
 use matrix_sdk::ruma::events::room::message::{MessageType, OriginalSyncRoomMessageEvent};
 use matrix_sdk::encryption::secret_storage::SecretStore;
-use matrix_sdk::ruma::exports::serde::Deserialize;
 
 use reqwest;
 
@@ -436,14 +431,6 @@ use std::sync::{Arc, Mutex};
 use anyhow::{anyhow, Context};
 #[cfg(any(feature = "e2ee-per-participant", feature = "e2e-encryption"))]
 use futures_util::StreamExt;
-#[cfg(feature = "e2e-encryption")]
-use matrix_sdk::encryption::secret_storage::SecretStore;
-use matrix_sdk::{
-    config::SyncSettings,
-    event_handler::EventHandlerDropGuard,
-    ruma::{OwnedRoomId, OwnedServerName, RoomId, RoomOrAliasId, ServerName},
-    Client, RoomState,
-};
 #[cfg(feature = "experimental-widgets")]
 use matrix_sdk::{
     ruma::{DeviceId, UserId},
