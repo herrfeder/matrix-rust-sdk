@@ -1,19 +1,55 @@
 #![recursion_limit = "256"]
 
+// Stuff from Matrix Bot
+
 #[derive(Clone)]
 pub struct AppState {
     pub matrix_client: Client,
 }
 
+use std::{env, fs};
 use once_cell::sync::Lazy;
-use serde::Deserialize;
-use std::fs;
 use std::sync::OnceLock;
-
-use once_cell::sync::Lazy;
 use std::collections::HashMap;
-use std::fs;
 use serde::Deserialize;
+
+#[derive(Debug, Deserialize)]
+pub struct Config {
+    pub home_server: String,
+    pub username: String,
+    pub password: String,
+    pub secretkey: String,
+    pub room_in_id: String,
+    pub room_out_id: String,
+    pub webserver_send: String,
+    pub webserver_spawn: String,
+    pub echo_commands: bool,
+    pub on_mention_only: bool
+}
+
+// Lazy static instance
+pub static BOTCONFIG: Lazy<Config> = Lazy::new(|| {
+    let data = fs::read_to_string("botconfig.json")
+        .expect("Failed to read strings.json");
+    serde_json::from_str(&data)
+        .expect("Failed to parse strings.json")
+});
+
+mod BotConfig;
+mod InputMapping;
+mod AppState;
+
+use reqwest;
+use url::Url;
+
+use axum::{
+    routing::get,
+    Router,
+    extract::Query,
+    response::IntoResponse,
+};
+use axum::extract::State;
+use axum;
 
 #[derive(Debug, Deserialize)]
 pub struct MappingEntry {
@@ -43,9 +79,359 @@ pub fn get_order(input: &str) -> Option<&str> {
 }
 
 
+use std::borrow::ToOwned;
+
+use matrix_sdk::{
+    config::SyncSettings,
+    room::Room,
+    ruma::events::room::message::RoomMessageEventContent,
+    Client,
+    RoomState,
+};
+
+use matrix_sdk::ruma::events::room::message::{MessageType, OriginalSyncRoomMessageEvent};
+use matrix_sdk::encryption::secret_storage::SecretStore;
+use matrix_sdk::ruma::exports::serde::Deserialize;
+
+use reqwest;
+
+use tracing::Level;
+use tracing_subscriber::filter::{filter_fn, FilterExt};
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
+use tracing_subscriber::{filter, Layer};
+
+use serde;
+
+use pulldown_cmark::{Parser, Options, html, Event, Tag};
+
+const BWI_TARGET: &str = "BWI";
+
+#[derive(Deserialize)]
+pub struct SearchResultParams {
+    pub result: String,
+}
+
+#[derive(Deserialize)]
+pub struct ExploreResultParams {
+    pub result: String,
+}
+
+fn markdown_to_html(markdown: &str) -> String {
+    let parser = Parser::new_ext(markdown, Options::all());
+    let mut html_output = String::new();
+    html::push_html(&mut html_output, parser);
+    html_output
+}
+
+fn markdown_to_plain(markdown: &str) -> String {
+    let parser = Parser::new(markdown);
+    let mut plain = String::new();
+
+    for event in parser {
+        match event {
+            Event::Text(text) | Event::Code(text) => {
+                plain.push_str(&text);
+            }
+            Event::Start(Tag::Link(_, _, title)) => {
+                plain.push_str(&title);
+            }
+            _ => {}
+        }
+    }
+
+    plain
+}
+
+fn emoji_to_unicode_codes(s: &str) -> String {
+    s.chars()
+        .map(|c| format!("U+{:04X}", c as u32))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+async fn send_message_to_bot(client: reqwest::Client,  message: String) -> Result<String, Box<dyn std::error::Error>> {
+    let mut params = HashMap::new();
+    let mut url =  Url::parse(&BotConfig::BOTCONFIG.webserver_send)?;
+    let mut isKill = false;
+
+    match InputMapping::get_order(&message) {
+        Some(order) => {
+            if order.eq("kill") {
+                url.path_segments_mut()
+                    .expect("cannot be base")
+                    .push("jetbot_kill");
+                isKill = true;
+            } else {
+                url.path_segments_mut()
+                    .expect("cannot be base")
+                    .push("jetbot_async");
+
+                match InputMapping::get_object(&message) {
+                    Some(object) => {
+                        params.insert( "order", order);
+                        params.insert("object", object);
+                    }
+                    None => {
+                        params.insert( "order", order);
+                        println!("Send parameterless order {}", order);
+                    }
+                }
+            }
+
+        }
+        None => {
+            eprintln!("Error: No mapping found for input: {} Unicode: {}", &message, emoji_to_unicode_codes(&message));
+        }
+    }
+
+    if isKill == true || !params.is_empty() {
+        println!("BOT::send_to_bot {}", &url);
+
+        let response = client.get(url)
+            .query(&params)
+            .send().await?
+            .text().await?;
+
+        println!("BOT::send_message_to_bot for {}", &message);
+    }
+
+    Ok("Request".to_string())
+}
+
+async fn on_room_message(event: OriginalSyncRoomMessageEvent, room: Room, client: Client) {
+    // First, we need to unpack the message: We only want messages from rooms we are
+    // still in and that are regular text messages - ignoring everything else.
+
+    let room_in_id = BotConfig::BOTCONFIG.room_in_id.parse::<matrix_sdk::ruma::OwnedRoomId>().expect("Invalid Room In ID");
+    let room_out_id = BotConfig::BOTCONFIG.room_out_id.parse::<matrix_sdk::ruma::OwnedRoomId>().expect("Invalid Room Out ID");
+
+    if room.state() != RoomState::Joined {
+        return;
+    }
+
+    // we only listen to the input room
+    if room.room_id() != room_in_id {
+        println!("BOT::OnRoomMessage wrong room ID {}", room.room_id());
+        return;
+    }
+
+    // for now we listen to text messages
+    let MessageType::Text(text_content) = event.content.msgtype else {
+        return
+    };
+
+    // only listen if we are mentioned
+    if BotConfig::BOTCONFIG.on_mention_only == true {
+        match event.content.mentions {
+            Some(mentions) => {
+                let user_ids = mentions.user_ids;
+                let my_user_id = BotConfig::BOTCONFIG.username.to_owned();
+
+                let mut isMentioned = false;
+                for item in &user_ids {
+                    println!("BOT::- {}", item);
+                    let cleaned = item.to_string();
+                    if cleaned.eq(&my_user_id) {
+                        println!("BOT:: Its Me ");
+                        isMentioned = true;
+                        break;
+                    }
+                }
+
+                if isMentioned == false {
+                    println!("BOT:: Its Not me");
+                    return
+                }
+            }
+            None => {
+                println!("BOT::No Mentions");
+                return
+            }
+        }
+    }
+
+    println!("BOT::sending");
+
+    let message = markdown_to_plain(&text_content.body);
+
+    // trim mentions from the command
+    if let Some((_, command_message)) = message.split_once(':') {
+        let cleaned_message = command_message.trim().to_string();
+
+        let reqwest_client = reqwest::Client::new();
+
+        match send_message_to_bot(reqwest_client, cleaned_message).await {
+            Ok(response) => println!("Response: {}", response),
+            Err(err) => eprintln!("Error: {}", err),
+        }
+    }
+
+    if BotConfig::BOTCONFIG.echo_commands == true {
+        let mut formatted_answer = String::new();
+        if let Some(room_output) = client.get_room(&room_out_id) {
+            if message.eq("left") || message.eq("right") || message.eq("forward") || message.eq("back") {
+                formatted_answer = format!("order: *{}*", message);
+            } else {
+                formatted_answer = format!("search: *{}*", message);
+            }
+
+            let html_answer = markdown_to_html(&formatted_answer);
+            let content_output = RoomMessageEventContent::text_html(&formatted_answer, &html_answer);
+            room_output.send(content_output).await.unwrap();
+        }
+    }
+
+    println!("BOT::message sent");
+}
+
+async fn login(
+    username: &str,
+    password: &str,
+) -> anyhow::Result<Client> {
+    // First, we set up the client.
+
+    // Note that when encryption is enabled, you should use a persistent store to be
+    // able to restore the session with a working encryption setup.
+    // See the `persist_session` example.
+
+    let client = Client::builder()
+        // We use the convenient client builder to set our custom homeserver URL on it.
+        .homeserver_url(&BotConfig::BOTCONFIG.home_server)
+        .build()
+        .await?;
+
+    // Then let's log that client in
+    client
+        .matrix_auth()
+        .login_username(username, password)
+        .initial_device_display_name("getting started bot")
+        .await?;
+
+    // It worked!
+    println!("logged in as {username}");
+
+    Ok(client)
+}
+
+async fn sync(client: Client) -> anyhow::Result<()> {
+    // An initial sync to set up state and so our bot doesn't respond to old
+    // messages. If the `StateStore` finds saved state in the location given the
+    // initial sync will be skipped in favor of loading state from the store
+    let sync_token = client.sync_once(SyncSettings::default()).await.unwrap().next_batch;
+
+    // now that we've synced, let's attach a handler for incoming room messages, so
+    // we can react on it
+    client.add_event_handler(on_room_message);
+
+    // since we called `sync_once` before we entered our sync loop we must pass
+    // that sync token to `sync`
+    let settings = SyncSettings::default().token(sync_token);
+    // this keeps state from the server streaming in to the bot via the
+    // EventHandler trait
+    client.sync(settings).await?; // this essentially loops until we kill the bot
+
+    Ok(())
+}
+
+async fn import_known_secrets(client: &Client, secret_store: SecretStore) -> anyhow::Result<()> {
+    secret_store.import_secrets().await?;
+
+    let status = client
+        .encryption()
+        .cross_signing_status()
+        .await
+        .expect("We should be able to get our cross-signing status");
+
+    if status.is_complete() {
+        println!("Successfully imported all the cross-signing keys");
+    } else {
+        eprintln!("Couldn't import all the cross-signing keys: {status:?}");
+    }
+
+    Ok(())
+}
+
+fn setup_logging(verbose: bool) {
+    println!("with verbose logging {:?}", verbose);
+    if verbose {
+        tracing_subscriber::registry()
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .with_filter(filter::LevelFilter::from_level(Level::DEBUG)),
+            )
+            .init();
+    } else {
+        tracing_subscriber::registry()
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .with_filter(filter_fn(|meta| meta.target() == BWI_TARGET))
+                    .with_filter(filter::LevelFilter::from_level(Level::INFO)),
+            )
+            .init();
+    }
+}
+
+async fn setup_webserver(state: AppState::AppState) {
+    let app = Router::new()
+        .route("/explore", get(handle_explore_result))
+        .route("/search", get(handle_search_result))
+        .with_state(state);
+
+    // run it
+    let listener = tokio::net::TcpListener::bind(&BotConfig::BOTCONFIG.webserver_spawn)
+        .await
+        .unwrap();
+
+    println!("listening on {}", listener.local_addr().unwrap());
+    axum::serve(listener, app).await.unwrap();
+}
+
+async fn handle_explore_result(
+        State(state): State<AppState::AppState>,
+        Query(params): Query<ExploreResultParams> )
+            -> impl IntoResponse {
+    println!("Received Explore");
+
+    let matrix_client = state.matrix_client;
+    let room_out_id = BotConfig::BOTCONFIG.room_out_id.parse::<matrix_sdk::ruma::OwnedRoomId>().expect("Invalid Room Out ID");
+
+    if let Some(room_output) = matrix_client.get_room(&room_out_id) {
+        let markdown = format!("{}", params.result);
+        let html = markdown_to_html(&markdown);
+
+        let content_output = RoomMessageEventContent::text_html(markdown, html);
+        room_output.send(content_output).await.unwrap();
+    }
+
+    format!("Received Explore: {}", params.result)
+}
+
+async fn handle_search_result(
+    State(state): State<AppState::AppState>,
+    Query(params): Query<SearchResultParams> )
+    -> impl IntoResponse {
+    println!("Received search");
+
+    let matrix_client = state.matrix_client;
+    let room_out_id = BotConfig::BOTCONFIG.room_out_id.parse::<matrix_sdk::ruma::OwnedRoomId>().expect("Invalid Room Out ID");
+
+    if let Some(room_output) = matrix_client.get_room(&room_out_id) {
+        let markdown = format!("{}", params.result);
+        let html = markdown_to_html(&markdown);
+
+        let content_output = RoomMessageEventContent::text_html(markdown, html);
+        room_output.send(content_output).await.unwrap();
+    }
+
+    format!("Received Search: {}", params.result)
+}
+
+
+// End Stuff from Matrix Bot
+
 #[cfg(any(feature = "experimental-widgets", all(feature = "v4l2", target_os = "linux")))]
 use std::sync::{Arc, Mutex};
-use std::{env, fs};
 
 use anyhow::{anyhow, Context};
 #[cfg(any(feature = "e2ee-per-participant", feature = "e2e-encryption"))]
@@ -80,7 +466,7 @@ use matrix_sdk_rtc_livekit::per_participant::{
 use matrix_sdk_rtc_livekit::{
     handle_connection_update as handle_livekit_connection_update, resolve_connection_details,
     run_livekit_driver_with_handler, LiveKitConnectionUpdate, LiveKitRoomOptionsProvider,
-    LiveKitSdkConnector, LiveKitTokenProvider, Room, RoomOptions,
+    LiveKitSdkConnector, LiveKitTokenProvider, Room as LivekitRoom, RoomOptions,
 };
 #[cfg(feature = "experimental-widgets")]
 use ruma::events::call::member::CallMemberStateKey;
@@ -127,6 +513,41 @@ fn v4l2_config_from_env() -> anyhow::Result<()> {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+
+    println!("BOT Config: {} {}", BotConfig::BOTCONFIG.home_server, BotConfig::BOTCONFIG.username);
+
+    setup_logging(false);
+
+    println!("before matrix setup");
+
+    // our actual runner
+    let client = login( &BotConfig::BOTCONFIG.username, &BotConfig::BOTCONFIG.password).await?;
+
+    println!("after matrix setup");
+
+    let shared_state = AppState::AppState {
+        matrix_client: client.clone(),
+    };
+
+    let secret_store =
+        client.encryption().secret_storage().open_secret_store(&BotConfig::BOTCONFIG.secretkey).await?;
+
+    import_known_secrets(&client, secret_store).await?;
+
+    println!("before webserver setup");
+
+    let _webserver_task = tokio::spawn(setup_webserver(shared_state));
+
+    println!("after webserver setup");
+
+    sync(client).await;
+
+    Ok(())
+}
+
+/*
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
 
     Ok(())
@@ -155,7 +576,7 @@ async fn main() -> anyhow::Result<()> {
     rtc.set_call_active(false).await?;
     rtc.shutdown().await;
 
-
+*/
 
 async fn run_rtc_livekit_join() -> anyhow::Result<RtcLiveKitRuntime> {
     let homeserver_url = required_env("HOMESERVER_URL")?;
@@ -743,7 +1164,7 @@ fn build_driver_state(
 
 async fn set_video_stream_enabled(
     state: &mut DriverState,
-    room_handle: Option<Arc<Room>>,
+    room_handle: Option<Arc<LivekitRoom>>,
     enabled: bool,
 ) -> LiveKitResult<()> {
     #[cfg(not(all(feature = "v4l2", target_os = "linux")))]
