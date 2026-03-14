@@ -1,5 +1,48 @@
 #![recursion_limit = "256"]
 
+#[derive(Clone)]
+pub struct AppState {
+    pub matrix_client: Client,
+}
+
+use once_cell::sync::Lazy;
+use serde::Deserialize;
+use std::fs;
+use std::sync::OnceLock;
+
+use once_cell::sync::Lazy;
+use std::collections::HashMap;
+use std::fs;
+use serde::Deserialize;
+
+#[derive(Debug, Deserialize)]
+pub struct MappingEntry {
+    pub object: String,
+    pub order: String
+}
+
+#[derive(Debug, Deserialize)]
+struct MappingFile {
+    mappings: HashMap<String, MappingEntry>,
+}
+
+pub static INPUTMAPPING: Lazy<HashMap<String, MappingEntry>> = Lazy::new(|| {
+    let json_str = fs::read_to_string("inputmapping.json")
+        .expect("Failed to read JSON file");
+    let parsed: MappingFile = serde_json::from_str(&json_str)
+        .expect("Failed to parse JSON into mapping structure");
+    parsed.mappings
+});
+
+pub fn get_object(input: &str) -> Option<&str> {
+    INPUTMAPPING.get(input).map(|entry| entry.object.as_str())
+}
+
+pub fn get_order(input: &str) -> Option<&str> {
+    INPUTMAPPING.get(input).map(|entry| entry.order.as_str())
+}
+
+
 #[cfg(any(feature = "experimental-widgets", all(feature = "v4l2", target_os = "linux")))]
 use std::sync::{Arc, Mutex};
 use std::{env, fs};
@@ -81,13 +124,40 @@ fn v4l2_config_from_env() -> anyhow::Result<()> {
     Ok(())
 }
 
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
-    run_rtc_livekit_join().await
-}
 
-async fn run_rtc_livekit_join() -> anyhow::Result<()> {
+    Ok(())
+}    
+
+
+    let rtc = run_rtc_livekit_join().await?;
+    rtc.set_call_active(true).await?;
+
+    //tokio::signal::ctrl_c().await.context("wait for ctrl+c")?;
+   // info!("received ctrl+c; shutting down rtc client");
+
+    thread::sleep(Duration::from_secs(10));
+    rtc.set_call_active(false).await?;
+    rtc.shutdown().await;
+
+    thread::sleep(Duration::from_secs(10));
+
+    let rtc = run_rtc_livekit_join().await?;
+    rtc.set_call_active(true).await?;
+
+    //tokio::signal::ctrl_c().await.context("wait for ctrl+c")?;
+    //info!("received ctrl+c; shutting down rtc client");
+
+    thread::sleep(Duration::from_secs(10));
+    rtc.set_call_active(false).await?;
+    rtc.shutdown().await;
+
+
+
+async fn run_rtc_livekit_join() -> anyhow::Result<RtcLiveKitRuntime> {
     let homeserver_url = required_env("HOMESERVER_URL")?;
     let username = required_env("MATRIX_USERNAME")?;
     let password = required_env("MATRIX_PASSWORD")?;
@@ -97,8 +167,7 @@ async fn run_rtc_livekit_join() -> anyhow::Result<()> {
     let livekit_sfu_get_url = optional_env("LIVEKIT_SFU_GET_URL");
     let v4l2_config = v4l2_config_from_env().context("read V4L2 config")?;
 
-    let store_dir =
-        env::current_dir().context("read current directory")?.join("matrix-sdk-store");
+    let store_dir = env::current_dir().context("read current directory")?.join("matrix-sdk-store");
     if store_dir.is_file() {
         warn!(
             store_path = %store_dir.display(),
@@ -176,6 +245,7 @@ async fn run_rtc_livekit_join() -> anyhow::Result<()> {
             .await
             .context("join room")?,
     };
+    let room_for_activation = room.clone();
     let element_call_url =
         optional_env("ELEMENT_CALL_URL").or_else(|| optional_env("ELEMENT_CALL_WIDGET"));
     #[cfg(feature = "experimental-widgets")]
@@ -250,13 +320,6 @@ async fn run_rtc_livekit_join() -> anyhow::Result<()> {
         .authenticated_service_url()
         .context("attach access_token to LiveKit service url")?;
 
-    #[cfg(feature = "experimental-widgets")]
-    if let Some(widget) = widget.as_ref() {
-        publish_call_membership_via_widget(room.clone(), widget, &service_url)
-            .await
-            .context("publish MatrixRTC membership via widget api")?;
-    }
-
     let token_provider = EnvLiveKitTokenProvider { token: livekit_token.clone() };
     #[cfg(feature = "e2ee-per-participant")]
     let e2ee_context = build_per_participant_e2ee(
@@ -288,7 +351,7 @@ async fn run_rtc_livekit_join() -> anyhow::Result<()> {
         register_e2ee_to_device_handler(
             &client,
             room.room_id().to_owned(),
-            std::sync::Arc::clone(&context.key_provider),
+            Arc::clone(&context.key_provider),
         )
     });
     #[cfg(feature = "e2ee-per-participant")]
@@ -328,44 +391,100 @@ async fn run_rtc_livekit_join() -> anyhow::Result<()> {
         token_len = livekit_token.len(),
         "starting LiveKit driver"
     );
-    tokio::select! {
-        run_result = run_livekit_driver_with_handler(
-            room.clone(),
+
+    let room_for_driver = room.clone();
+    let service_url_for_driver = service_url.clone();
+    let driver_handle = tokio::spawn(async move {
+        run_livekit_driver_with_handler(
+            room_for_driver,
             &connector,
-            &service_url,
+            &service_url_for_driver,
             build_driver_state(
-                room.clone(),
+                room,
                 #[cfg(all(feature = "v4l2", target_os = "linux"))]
                 v4l2_config,
                 #[cfg(feature = "e2ee-per-participant")]
-                e2ee_context.clone(),
+                e2ee_context,
             ),
             |state, update| async move {
-                handle_livekit_connection_update(state, update, &handle_driver_connection_update).await
+                handle_livekit_connection_update(state, update, &handle_driver_connection_update)
+                    .await
             },
-        ) => {
-            let _ = run_result.context("run LiveKit room driver")?;
-        }
-        ctrlc_result = tokio::signal::ctrl_c() => {
-            ctrlc_result.context("wait for ctrl+c")?;
-            info!("received ctrl+c; shutting down rtc client");
+        )
+        .await
+        .context("run LiveKit room driver")
+    });
 
-            #[cfg(feature = "experimental-widgets")]
-            if let Some(widget) = widget.as_ref() {
-                if let Err(err) = send_hangup_via_widget(widget, shutdown_membership_state_key.as_ref()).await {
-                    info!(?err, "failed to send shutdown membership send_event via widget api during shutdown");
+    Ok(RtcLiveKitRuntime {
+        room: room_for_activation,
+        service_url,
+        #[cfg(feature = "experimental-widgets")]
+        widget,
+        #[cfg(feature = "experimental-widgets")]
+        shutdown_membership_state_key,
+        sync_handle,
+        driver_handle,
+    })
+}
+
+struct RtcLiveKitRuntime {
+    room: matrix_sdk::Room,
+    service_url: String,
+    #[cfg(feature = "experimental-widgets")]
+    widget: Option<ElementCallWidget>,
+    #[cfg(feature = "experimental-widgets")]
+    shutdown_membership_state_key: Option<CallMemberStateKey>,
+    sync_handle: tokio::task::JoinHandle<Result<(), matrix_sdk::Error>>,
+    driver_handle: tokio::task::JoinHandle<anyhow::Result<DriverState>>,
+}
+
+impl RtcLiveKitRuntime {
+    async fn set_call_active(&self, active: bool) -> anyhow::Result<()> {
+        #[cfg(feature = "experimental-widgets")]
+        {
+            if let Some(widget) = self.widget.as_ref() {
+                if active {
+                    publish_call_membership_via_widget(
+                        self.room.clone(),
+                        widget,
+                        self.service_url.as_str(),
+                    )
+                    .await
+                    .context("publish MatrixRTC membership via widget api")?;
+                } else {
+                    send_hangup_via_widget(widget, self.shutdown_membership_state_key.as_ref())
+                        .await
+                        .context("send shutdown membership via widget api")?;
                 }
-            }
 
-            sync_handle.abort();
-            info!("ctrl+c shutdown flow finished; exiting process");
-            std::process::exit(0);
+                return Ok(());
+            }
         }
+
+        if active {
+            warn!(
+                "set_call_active(true) requested without experimental widget support; activation must come from room call memberships"
+            );
+        } else {
+            info!(
+                "set_call_active(false) requested without experimental widget support; no local hangup message can be sent"
+            );
+        }
+
+        Ok(())
     }
 
-    sync_handle.abort();
+    async fn shutdown(self) {
+        if let Err(err) = self.set_call_active(false).await {
+            info!(?err, "failed to deactivate call while shutting down runtime");
+        }
 
-    Ok(())
+        self.sync_handle.abort();
+        self.driver_handle.abort();
+
+        let _ = self.sync_handle.await;
+        let _ = self.driver_handle.await;
+    }
 }
 
 fn required_env(name: &str) -> anyhow::Result<String> {
@@ -389,7 +508,6 @@ fn retry_attempts_from_env(name: &str, default: usize) -> usize {
 fn retry_seconds_from_env(name: &str, default: u64) -> u64 {
     optional_env(name).and_then(|value| value.parse::<u64>().ok()).unwrap_or(default)
 }
-
 
 #[cfg(feature = "e2ee-per-participant")]
 fn spawn_periodic_e2ee_key_resend(room: matrix_sdk::Room, context: PerParticipantE2eeContext) {
@@ -645,7 +763,7 @@ async fn set_video_stream_enabled(
                     state.v4l2_publisher = Some(publisher);
                 }
             }
-        } else if let Some(publisher) = state.v4l2_publisher.take() {
+        } else if let Some(mut publisher) = state.v4l2_publisher.take() {
             publisher.stop().await.map_err(|err| LiveKitError::connector(V4l2PublishError(err)))?;
         }
     }

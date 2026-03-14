@@ -53,9 +53,9 @@ impl std::error::Error for V4l2PublishError {}
 pub(crate) struct V4l2CameraPublisher {
     room: Arc<Room>,
     track: matrix_sdk_rtc_livekit::livekit::track::LocalVideoTrack,
-    stop_tx: std::sync::mpsc::Sender<()>,
-    task: tokio::task::JoinHandle<anyhow::Result<()>>,
-    stdin_overlay_task: tokio::task::JoinHandle<()>,
+    stop_tx: Option<std::sync::mpsc::Sender<()>>,
+    task: Option<tokio::task::JoinHandle<anyhow::Result<()>>>,
+    stdin_overlay_task: Option<tokio::task::JoinHandle<()>>,
 }
 
 #[cfg(all(feature = "v4l2", target_os = "linux"))]
@@ -86,10 +86,7 @@ enum ZmqPayloadEncoding {
 
 #[cfg(all(feature = "v4l2", target_os = "linux"))]
 impl V4l2CameraPublisher {
-    pub(crate) async fn start(
-        room: Arc<Room>,
-        config: V4l2Config,
-    ) -> anyhow::Result<Self> {
+    pub(crate) async fn start(room: Arc<Room>, config: V4l2Config) -> anyhow::Result<Self> {
         use matrix_sdk_rtc_livekit::livekit::options::{TrackPublishOptions, VideoCodec};
         use matrix_sdk_rtc_livekit::livekit::track::{LocalTrack, TrackSource};
         use matrix_sdk_rtc_livekit::livekit::webrtc::prelude::RtcVideoSource;
@@ -146,20 +143,47 @@ impl V4l2CameraPublisher {
             }
         });
 
-        Ok(Self { room, track, stop_tx, task, stdin_overlay_task })
+        Ok(Self {
+            room,
+            track,
+            stop_tx: Some(stop_tx),
+            task: Some(task),
+            stdin_overlay_task: Some(stdin_overlay_task),
+        })
     }
 
-    pub(crate) async fn stop(self) -> anyhow::Result<()> {
+    pub(crate) async fn stop(&mut self) -> anyhow::Result<()> {
         info!(room_name = %self.room.name(), "stopping V4L2 camera track");
-        let _ = self.stop_tx.send(());
-        self.stdin_overlay_task.abort();
-        let _ = self.task.await?;
+        if let Some(stop_tx) = self.stop_tx.take() {
+            let _ = stop_tx.send(());
+        }
+        if let Some(stdin_overlay_task) = self.stdin_overlay_task.take() {
+            stdin_overlay_task.abort();
+        }
+        if let Some(task) = self.task.take() {
+            let _ = task.await?;
+        }
         self.room
             .local_participant()
             .unpublish_track(&self.track.sid())
             .await
             .context("unpublish V4L2 camera track")?;
         Ok(())
+    }
+}
+
+#[cfg(all(feature = "v4l2", target_os = "linux"))]
+impl Drop for V4l2CameraPublisher {
+    fn drop(&mut self) {
+        if let Some(stop_tx) = self.stop_tx.take() {
+            let _ = stop_tx.send(());
+        }
+        if let Some(stdin_overlay_task) = self.stdin_overlay_task.take() {
+            stdin_overlay_task.abort();
+        }
+        if let Some(task) = self.task.take() {
+            task.abort();
+        }
     }
 }
 
