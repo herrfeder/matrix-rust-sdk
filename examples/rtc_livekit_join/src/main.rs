@@ -33,7 +33,7 @@ use matrix_sdk::ruma::events::room::message::{
 };
 
 use tracing::Level;
-use tracing_subscriber::filter::{filter_fn, FilterExt};
+use tracing_subscriber::filter::filter_fn;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{filter, Layer};
@@ -49,7 +49,14 @@ fn bot_config() -> &'static BotConfig::Config {
 }
 
 fn init_bot_config() -> anyhow::Result<&'static BotConfig::Config> {
-    BOT_CONFIG.get_or_try_init(BotConfig::Config::from_env)
+    if let Some(config) = BOT_CONFIG.get() {
+        return Ok(config);
+    }
+
+    let config = BotConfig::Config::from_env()?;
+    let _ = BOT_CONFIG.set(config);
+
+    BOT_CONFIG.get().ok_or_else(|| anyhow!("failed to initialize bot config"))
 }
 
 #[derive(Deserialize)]
@@ -132,7 +139,7 @@ async fn send_message_to_bot(
     if isKill == true || !params.is_empty() {
         println!("BOT::send_to_bot {}", &url);
 
-        let response = client.get(url).query(&params).send().await?.text().await?;
+        let _response = client.get(url).query(&params).send().await?.text().await?;
 
         println!("BOT::send_message_to_bot for {}", &message);
     }
@@ -144,14 +151,8 @@ async fn on_room_message(event: OriginalSyncRoomMessageEvent, room: Room, client
     // First, we need to unpack the message: We only want messages from rooms we are
     // still in and that are regular text messages - ignoring everything else.
 
-    let room_in_id = bot_config()
-        .room_in_id
-        .parse::<matrix_sdk::ruma::OwnedRoomId>()
-        .expect("Invalid Room In ID");
-    let room_out_id = bot_config()
-        .room_out_id
-        .parse::<matrix_sdk::ruma::OwnedRoomId>()
-        .expect("Invalid Room Out ID");
+    let room_in_id = bot_config().room_in_id.parse::<OwnedRoomId>().expect("Invalid Room In ID");
+    let room_out_id = bot_config().room_out_id.parse::<OwnedRoomId>().expect("Invalid Room Out ID");
 
     if room.state() != RoomState::Joined {
         return;
@@ -223,17 +224,16 @@ async fn on_room_message(event: OriginalSyncRoomMessageEvent, room: Room, client
     }
 
     if bot_config().echo_commands == true {
-        let mut formatted_answer = String::new();
         if let Some(room_output) = client.get_room(&room_out_id) {
-            if message.eq("left")
+            let formatted_answer = if message.eq("left")
                 || message.eq("right")
                 || message.eq("forward")
                 || message.eq("back")
             {
-                formatted_answer = format!("order: *{}*", message);
+                format!("order: *{}*", message)
             } else {
-                formatted_answer = format!("search: *{}*", message);
-            }
+                format!("search: *{}*", message)
+            };
 
             let html_answer = markdown_to_html(&formatted_answer);
             let content_output =
@@ -417,10 +417,7 @@ async fn handle_explore_result(
     println!("Received Explore");
 
     let matrix_client = state.matrix_client;
-    let room_out_id = bot_config()
-        .room_out_id
-        .parse::<matrix_sdk::ruma::OwnedRoomId>()
-        .expect("Invalid Room Out ID");
+    let room_out_id = bot_config().room_out_id.parse::<OwnedRoomId>().expect("Invalid Room Out ID");
 
     if let Some(room_output) = matrix_client.get_room(&room_out_id) {
         let markdown = format!("{}", params.result);
@@ -440,10 +437,7 @@ async fn handle_search_result(
     println!("Received search");
 
     let matrix_client = state.matrix_client;
-    let room_out_id = bot_config()
-        .room_out_id
-        .parse::<matrix_sdk::ruma::OwnedRoomId>()
-        .expect("Invalid Room Out ID");
+    let room_out_id = bot_config().room_out_id.parse::<OwnedRoomId>().expect("Invalid Room Out ID");
 
     if let Some(room_output) = matrix_client.get_room(&room_out_id) {
         let markdown = format!("{}", params.result);
@@ -458,23 +452,15 @@ async fn handle_search_result(
 
 // End Stuff from Matrix Bot
 
-#[cfg(any(feature = "experimental-widgets", all(feature = "v4l2", target_os = "linux")))]
-use std::sync::{Arc, Mutex};
-
 use anyhow::{anyhow, Context};
-#[cfg(any(feature = "e2ee-per-participant", feature = "e2e-encryption"))]
-use futures_util::StreamExt;
 #[cfg(feature = "experimental-widgets")]
-use matrix_sdk::{
-    ruma::{DeviceId, UserId},
-    widget::{
-        element_call_member_content, element_call_send_event_message, start_element_call_widget,
-        ClientProperties, ElementCallWidget, ElementCallWidgetOptions, EncryptionSystem, Intent,
-    },
+use matrix_sdk::widget::{
+    element_call_member_content, element_call_send_event_message, start_element_call_widget,
+    ClientProperties, ElementCallWidget, ElementCallWidgetOptions, EncryptionSystem, Intent,
 };
 #[cfg(all(feature = "v4l2", target_os = "linux"))]
 use matrix_sdk_rtc::LiveKitError;
-use matrix_sdk_rtc::{LiveKitConnector, LiveKitResult};
+use matrix_sdk_rtc::LiveKitResult;
 #[cfg(feature = "e2ee-per-participant")]
 use matrix_sdk_rtc_livekit::livekit::id::ParticipantIdentity;
 #[cfg(feature = "e2ee-per-participant")]
@@ -509,7 +495,7 @@ struct DefaultRoomOptionsProvider;
 
 #[async_trait::async_trait]
 impl LiveKitTokenProvider for EnvLiveKitTokenProvider {
-    async fn token(&self, _room: &matrix_sdk::Room) -> LiveKitResult<String> {
+    async fn token(&self, _room: &Room) -> LiveKitResult<String> {
         Ok(self.token.clone())
     }
 }
@@ -833,7 +819,7 @@ async fn run_rtc_livekit_join() -> anyhow::Result<RtcLiveKitRuntime> {
 }
 
 struct RtcLiveKitRuntime {
-    room: matrix_sdk::Room,
+    room: Room,
     service_url: String,
     #[cfg(feature = "experimental-widgets")]
     widget: Option<ElementCallWidget>,
@@ -915,7 +901,7 @@ fn retry_seconds_from_env(name: &str, default: u64) -> u64 {
 }
 
 #[cfg(feature = "e2ee-per-participant")]
-fn spawn_periodic_e2ee_key_resend(room: matrix_sdk::Room, context: PerParticipantE2eeContext) {
+fn spawn_periodic_e2ee_key_resend(room: Room, context: PerParticipantE2eeContext) {
     let interval_secs = retry_seconds_from_env("PER_PARTICIPANT_KEY_RESEND_SECS", 0);
     if interval_secs == 0 {
         return;
@@ -939,11 +925,11 @@ fn spawn_periodic_e2ee_key_resend(room: matrix_sdk::Room, context: PerParticipan
 }
 
 #[cfg(not(feature = "e2ee-per-participant"))]
-fn spawn_periodic_e2ee_key_resend(_room: matrix_sdk::Room, _context: ()) {}
+fn spawn_periodic_e2ee_key_resend(_room: Room, _context: ()) {}
 
 #[cfg(feature = "experimental-widgets")]
 async fn publish_call_membership_via_widget(
-    room: matrix_sdk::Room,
+    room: Room,
     widget: &ElementCallWidget,
     service_url: &str,
 ) -> anyhow::Result<()> {
@@ -1121,7 +1107,7 @@ fn register_room_message_key_probe_handler(
 }
 
 struct DriverState {
-    room: matrix_sdk::Room,
+    room: Room,
     #[cfg(all(feature = "v4l2", target_os = "linux"))]
     v4l2_config: Option<V4l2Config>,
     #[cfg(all(feature = "v4l2", target_os = "linux"))]
@@ -1131,7 +1117,7 @@ struct DriverState {
 }
 
 fn build_driver_state(
-    room: matrix_sdk::Room,
+    room: Room,
     #[cfg(all(feature = "v4l2", target_os = "linux"))] v4l2_config: Option<V4l2Config>,
     #[cfg(feature = "e2ee-per-participant")] e2ee_context: Option<PerParticipantE2eeContext>,
 ) -> DriverState {
