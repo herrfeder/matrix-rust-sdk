@@ -3,7 +3,6 @@
 // Stuff from Matrix Bot
 
 mod AppState;
-use crate::AppState::AppState;
 use std::{env, fs};
 use once_cell::sync::Lazy;
 use std::sync::OnceLock;
@@ -89,8 +88,6 @@ use matrix_sdk::ruma::events::room::message::{
     MessageType, OriginalSyncRoomMessageEvent, RoomMessageEventContent,
 };
 use matrix_sdk::encryption::secret_storage::SecretStore;
-
-use reqwest;
 
 use tracing::Level;
 use tracing_subscriber::filter::{filter_fn, FilterExt};
