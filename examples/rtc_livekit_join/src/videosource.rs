@@ -91,7 +91,7 @@ impl MotionDetector {
     fn detect_and_snapshot(
         &mut self,
         y_plane: &[u8],
-        stride_y: i32,
+        stride_y: u32,
         width: usize,
         height: usize,
     ) -> Option<Vec<u8>> {
