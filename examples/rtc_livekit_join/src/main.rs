@@ -15,16 +15,16 @@ use url::Url;
 
 use axum;
 use axum::extract::State;
-use axum::{extract::Query, response::IntoResponse, routing::get, Router};
+use axum::{Router, extract::Query, response::IntoResponse, routing::get};
 
 use std::borrow::ToOwned;
 
 use matrix_sdk::{
+    Client, RoomState,
     config::SyncSettings,
     event_handler::EventHandlerDropGuard,
     room::Room,
     ruma::{OwnedRoomId, OwnedServerName, RoomId, RoomOrAliasId, ServerName},
-    Client, RoomState,
 };
 
 use matrix_sdk::encryption::secret_storage::SecretStore;
@@ -36,9 +36,9 @@ use tracing::Level;
 use tracing_subscriber::filter::filter_fn;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
-use tracing_subscriber::{filter, Layer};
+use tracing_subscriber::{Layer, filter};
 
-use pulldown_cmark::{html, Event, Options, Parser, Tag};
+use pulldown_cmark::{Event, Options, Parser, Tag, html};
 
 const BWI_TARGET: &str = "BWI";
 static RTC_RUNTIME: OnceLock<Arc<RtcLiveKitRuntime>> = OnceLock::new();
@@ -452,11 +452,11 @@ async fn handle_search_result(
 
 // End Stuff from Matrix Bot
 
-use anyhow::{anyhow, Context};
+use anyhow::{Context, anyhow};
 #[cfg(feature = "experimental-widgets")]
 use matrix_sdk::widget::{
-    element_call_member_content, element_call_send_event_message, start_element_call_widget,
     ClientProperties, ElementCallWidget, ElementCallWidgetOptions, EncryptionSystem, Intent,
+    element_call_member_content, element_call_send_event_message, start_element_call_widget,
 };
 #[cfg(all(feature = "v4l2", target_os = "linux"))]
 use matrix_sdk_rtc::LiveKitError;
@@ -465,14 +465,14 @@ use matrix_sdk_rtc::LiveKitResult;
 use matrix_sdk_rtc_livekit::livekit::id::ParticipantIdentity;
 #[cfg(feature = "e2ee-per-participant")]
 use matrix_sdk_rtc_livekit::per_participant::{
-    build_per_participant_e2ee, per_participant_key_grace_period_from_env,
-    register_e2ee_to_device_handler, send_per_participant_keys, spawn_livekit_e2ee_event_resend,
-    E2eeRoomOptionsProvider, PerParticipantE2eeContext,
+    E2eeRoomOptionsProvider, PerParticipantE2eeContext, build_per_participant_e2ee,
+    per_participant_key_grace_period_from_env, register_e2ee_to_device_handler,
+    send_per_participant_keys, spawn_livekit_e2ee_event_resend,
 };
 use matrix_sdk_rtc_livekit::{
-    handle_connection_update as handle_livekit_connection_update, resolve_connection_details,
-    run_livekit_driver_with_handler, LiveKitConnectionUpdate, LiveKitRoomOptionsProvider,
-    LiveKitSdkConnector, LiveKitTokenProvider, Room as LivekitRoom, RoomOptions,
+    LiveKitConnectionUpdate, LiveKitRoomOptionsProvider, LiveKitSdkConnector, LiveKitTokenProvider,
+    Room as LivekitRoom, RoomOptions, handle_connection_update as handle_livekit_connection_update,
+    resolve_connection_details, run_livekit_driver_with_handler,
 };
 #[cfg(feature = "experimental-widgets")]
 use ruma::events::call::member::CallMemberStateKey;
@@ -509,7 +509,7 @@ impl LiveKitRoomOptionsProvider for DefaultRoomOptionsProvider {
 #[cfg(all(feature = "v4l2", target_os = "linux"))]
 mod videosource;
 #[cfg(all(feature = "v4l2", target_os = "linux"))]
-use videosource::{v4l2_config_from_env, V4l2CameraPublisher, V4l2Config, V4l2PublishError};
+use videosource::{V4l2CameraPublisher, V4l2Config, V4l2PublishError, v4l2_config_from_env};
 
 #[cfg(not(all(feature = "v4l2", target_os = "linux")))]
 fn v4l2_config_from_env() -> anyhow::Result<()> {
@@ -542,14 +542,18 @@ async fn main() -> anyhow::Result<()> {
     )
     .await?;
 
-    let rtc_runtime = Arc::new(run_rtc_livekit_join().await?);
+    let rtc_runtime = Arc::new(run_rtc_livekit_join(client.clone()).await?);
     let _ = RTC_RUNTIME.set(rtc_runtime.clone());
 
     println!("after matrix setup");
 
     let shared_state = AppState::AppState { matrix_client: client.clone(), rtc_runtime };
 
-    let secret_store = client.encryption().secret_storage().open_secret_store(secret_key.as_deref().unwrap()).await?;
+    let secret_store = client
+        .encryption()
+        .secret_storage()
+        .open_secret_store(secret_key.as_deref().unwrap())
+        .await?;
     import_known_secrets(&client, secret_store).await?;
 
     println!("before webserver setup");
@@ -596,28 +600,11 @@ async fn main() -> anyhow::Result<()> {
 
 */
 
-async fn run_rtc_livekit_join() -> anyhow::Result<RtcLiveKitRuntime> {
-    let homeserver_url = required_env("HOMESERVER_URL")?;
-    let username = required_env("MATRIX_USERNAME")?;
-    let password = required_env("MATRIX_PASSWORD")?;
+async fn run_rtc_livekit_join(client: Client) -> anyhow::Result<RtcLiveKitRuntime> {
     let room_id_or_alias = required_env("ROOM_ID")?;
-    let device_id = optional_env("MATRIX_DEVICE_ID");
     let livekit_service_url_override = optional_env("LIVEKIT_SERVICE_URL");
     let livekit_sfu_get_url = optional_env("LIVEKIT_SFU_GET_URL");
     let v4l2_config = v4l2_config_from_env().context("read V4L2 config")?;
-
-    let store_dir = env::current_dir().context("read current directory")?.join("matrix-sdk-store");
-    prepare_sqlite_store_dir(&store_dir)?;
-
-    let client = login(
-        &homeserver_url,
-        &username,
-        &password,
-        device_id.as_deref(),
-        Some(&store_dir),
-        "rtc-livekit-join",
-    )
-    .await?;
 
     let room_id_or_alias = RoomOrAliasId::parse(room_id_or_alias).context("parse ROOM_ID")?;
     let via_servers = via_servers_from_env().context("parse VIA_SERVERS")?;
