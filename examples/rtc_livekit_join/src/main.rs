@@ -4,8 +4,7 @@
 
 mod AppState;
 use serde::Deserialize;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, LazyLock};
 use std::{env, fs};
 
 mod BotConfig;
@@ -42,8 +41,8 @@ use tracing_subscriber::{filter, Layer};
 use pulldown_cmark::{html, Event, Options, Parser, Tag};
 
 const BWI_TARGET: &str = "BWI";
-static RTC_RUNTIME: OnceLock<Arc<RtcLiveKitRuntime>> = OnceLock::new();
-static RTC_CALL_ACTIVE: AtomicBool = AtomicBool::new(false);
+static RTC_RUNTIME: LazyLock<tokio::sync::Mutex<Option<Arc<RtcLiveKitRuntime>>>> =
+    LazyLock::new(|| tokio::sync::Mutex::new(None));
 static BOT_CONFIG: OnceLock<BotConfig::Config> = OnceLock::new();
 
 fn bot_config() -> &'static BotConfig::Config {
@@ -208,22 +207,27 @@ async fn on_room_message(event: OriginalSyncRoomMessageEvent, room: Room, client
         let cleaned_message = command_message.trim().to_string();
 
         if cleaned_message == "🎥" {
-            if let Some(runtime) = RTC_RUNTIME.get() {
-                if RTC_CALL_ACTIVE.load(Ordering::SeqCst) {
-                    if let Err(err) = runtime.set_call_active(false).await {
-                        eprintln!("Error deactivating rtc call: {err:#}");
-                    }
-                    runtime.shutdown_call_session().await;
-                    RTC_CALL_ACTIVE.store(false, Ordering::SeqCst);
-                } else {
-                    if let Err(err) = runtime.set_call_active(true).await {
-                        eprintln!("Error activating rtc call: {err:#}");
-                    } else {
-                        RTC_CALL_ACTIVE.store(true, Ordering::SeqCst);
-                    }
+            let mut runtime_guard = RTC_RUNTIME.lock().await;
+
+            if let Some(runtime) = runtime_guard.as_ref() {
+                if let Err(err) = runtime.set_call_active(false).await {
+                    eprintln!("Error deactivating rtc call: {err:#}");
                 }
+                runtime.shutdown_call_session();
+                *runtime_guard = None;
             } else {
-                eprintln!("RTC runtime not initialized; cannot toggle call");
+                match run_rtc_livekit_join(client.clone()).await {
+                    Ok(runtime) => {
+                        let runtime = Arc::new(runtime);
+                        if let Err(err) = runtime.set_call_active(true).await {
+                            eprintln!("Error activating rtc call: {err:#}");
+                            runtime.shutdown_call_session();
+                        } else {
+                            *runtime_guard = Some(runtime);
+                        }
+                    }
+                    Err(err) => eprintln!("Error starting rtc runtime: {err:#}"),
+                }
             }
         } else {
             let reqwest_client = reqwest::Client::new();
@@ -554,12 +558,9 @@ async fn main() -> anyhow::Result<()> {
     )
     .await?;
 
-    let rtc_runtime = Arc::new(run_rtc_livekit_join(client.clone()).await?);
-    let _ = RTC_RUNTIME.set(rtc_runtime.clone());
-
     println!("after matrix setup");
 
-    let shared_state = AppState::AppState { matrix_client: client.clone(), rtc_runtime };
+    let shared_state = AppState::AppState { matrix_client: client.clone() };
 
     let secret_store = client
         .encryption()
@@ -859,7 +860,7 @@ impl RtcLiveKitRuntime {
         Ok(())
     }
 
-    async fn shutdown_call_session(&self) {
+    fn shutdown_call_session(&self) {
         self.sync_handle.abort();
         self.driver_handle.abort();
     }
@@ -869,7 +870,7 @@ impl RtcLiveKitRuntime {
             info!(?err, "failed to deactivate call while shutting down runtime");
         }
 
-        self.shutdown_call_session().await;
+        self.shutdown_call_session();
 
         let _ = self.sync_handle.await;
         let _ = self.driver_handle.await;
