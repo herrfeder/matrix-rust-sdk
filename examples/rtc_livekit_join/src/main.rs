@@ -527,6 +527,7 @@ async fn main() -> anyhow::Result<()> {
     let username = required_env("MATRIX_USERNAME")?;
     let password = required_env("MATRIX_PASSWORD")?;
     let device_id = optional_env("MATRIX_DEVICE_ID");
+    let secret_key = optional_env("MATRIX_RECOVERY_KEY");
     let store_dir = env::current_dir().context("read current directory")?.join("matrix-sdk-store");
     prepare_sqlite_store_dir(&store_dir)?;
 
@@ -548,12 +549,8 @@ async fn main() -> anyhow::Result<()> {
 
     let shared_state = AppState::AppState { matrix_client: client.clone(), rtc_runtime };
 
-    if let Some(secret_key) = bot_cfg.secret_key.as_deref() {
-        let secret_store =
-            client.encryption().secret_storage().open_secret_store(secret_key).await?;
-
-        import_known_secrets(&client, secret_store).await?;
-    }
+    let secret_store = client.encryption().secret_storage().open_secret_store(secret_key.as_deref().unwrap()).await?;
+    import_known_secrets(&client, secret_store).await?;
 
     println!("before webserver setup");
 
