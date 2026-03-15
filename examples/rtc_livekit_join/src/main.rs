@@ -519,8 +519,6 @@ fn v4l2_config_from_env() -> anyhow::Result<()> {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let bot_cfg = init_bot_config()?;
-    InputMapping::validate_input_mapping_from_env()?;
-
     setup_logging(false);
 
     println!("before matrix setup");
