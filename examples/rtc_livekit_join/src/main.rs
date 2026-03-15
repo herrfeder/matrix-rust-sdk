@@ -4,7 +4,7 @@
 
 mod AppState;
 use serde::Deserialize;
-use std::sync::{Arc, LazyLock};
+use std::sync::{Arc, LazyLock, OnceLock};
 use std::{env, fs};
 
 mod BotConfig;
@@ -683,13 +683,10 @@ async fn run_rtc_livekit_join(client: Client) -> anyhow::Result<RtcLiveKitRuntim
     let widget: Option<()> = None;
 
     #[cfg(feature = "e2ee-per-participant")]
-    let _to_device_probe_guard = register_any_to_device_probe_handler(&client);
+    let to_device_probe_guard = register_any_to_device_probe_handler(&client);
     #[cfg(feature = "e2ee-per-participant")]
-    let _room_message_probe_guard =
+    let room_message_probe_guard =
         register_room_message_key_probe_handler(&client, room.room_id().to_owned());
-
-    let sync_client = client.clone();
-    let sync_handle = tokio::spawn(async move { sync_client.sync(SyncSettings::new()).await });
 
     let static_livekit_token = optional_env("LIVEKIT_TOKEN");
     let connection_details = resolve_connection_details(
@@ -733,7 +730,7 @@ async fn run_rtc_livekit_join(client: Client) -> anyhow::Result<RtcLiveKitRuntim
         }
     }
     #[cfg(feature = "e2ee-per-participant")]
-    let _e2ee_to_device_guard = e2ee_context.as_ref().map(|context| {
+    let e2ee_to_device_guard = e2ee_context.as_ref().map(|context| {
         register_e2ee_to_device_handler(
             &client,
             room.room_id().to_owned(),
@@ -808,7 +805,12 @@ async fn run_rtc_livekit_join(client: Client) -> anyhow::Result<RtcLiveKitRuntim
         widget,
         #[cfg(feature = "experimental-widgets")]
         shutdown_membership_state_key,
-        sync_handle,
+        #[cfg(feature = "e2ee-per-participant")]
+        e2ee_to_device_guard,
+        #[cfg(feature = "e2ee-per-participant")]
+        to_device_probe_guard,
+        #[cfg(feature = "e2ee-per-participant")]
+        room_message_probe_guard,
         driver_handle,
     })
 }
@@ -820,7 +822,12 @@ struct RtcLiveKitRuntime {
     widget: Option<ElementCallWidget>,
     #[cfg(feature = "experimental-widgets")]
     shutdown_membership_state_key: Option<CallMemberStateKey>,
-    sync_handle: tokio::task::JoinHandle<Result<(), matrix_sdk::Error>>,
+    #[cfg(feature = "e2ee-per-participant")]
+    e2ee_to_device_guard: Option<EventHandlerDropGuard>,
+    #[cfg(feature = "e2ee-per-participant")]
+    to_device_probe_guard: EventHandlerDropGuard,
+    #[cfg(feature = "e2ee-per-participant")]
+    room_message_probe_guard: EventHandlerDropGuard,
     driver_handle: tokio::task::JoinHandle<anyhow::Result<DriverState>>,
 }
 
@@ -861,7 +868,6 @@ impl RtcLiveKitRuntime {
     }
 
     fn shutdown_call_session(&self) {
-        self.sync_handle.abort();
         self.driver_handle.abort();
     }
 
@@ -872,7 +878,6 @@ impl RtcLiveKitRuntime {
 
         self.shutdown_call_session();
 
-        let _ = self.sync_handle.await;
         let _ = self.driver_handle.await;
     }
 }
