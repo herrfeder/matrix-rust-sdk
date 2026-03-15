@@ -3,33 +3,9 @@
 // Stuff from Matrix Bot
 
 mod AppState;
-use std::{env, fs};
-use once_cell::sync::Lazy;
-use std::sync::OnceLock;
-use std::collections::HashMap;
 use serde::Deserialize;
-
-#[derive(Debug, Deserialize)]
-pub struct Config {
-    pub home_server: String,
-    pub username: String,
-    pub password: String,
-    pub secretkey: String,
-    pub room_in_id: String,
-    pub room_out_id: String,
-    pub webserver_send: String,
-    pub webserver_spawn: String,
-    pub echo_commands: bool,
-    pub on_mention_only: bool
-}
-
-// Lazy static instance
-pub static BOTCONFIG: Lazy<Config> = Lazy::new(|| {
-    let data = fs::read_to_string("botconfig.json")
-        .expect("Failed to read strings.json");
-    serde_json::from_str(&data)
-        .expect("Failed to parse strings.json")
-});
+use std::sync::{Arc, OnceLock};
+use std::{env, fs};
 
 mod BotConfig;
 mod InputMapping;
@@ -37,42 +13,9 @@ mod InputMapping;
 use reqwest;
 use url::Url;
 
-use axum::{
-    routing::get,
-    Router,
-    extract::Query,
-    response::IntoResponse,
-};
-use axum::extract::State;
 use axum;
-
-#[derive(Debug, Deserialize)]
-pub struct MappingEntry {
-    pub object: String,
-    pub order: String
-}
-
-#[derive(Debug, Deserialize)]
-struct MappingFile {
-    mappings: HashMap<String, MappingEntry>,
-}
-
-pub static INPUTMAPPING: Lazy<HashMap<String, MappingEntry>> = Lazy::new(|| {
-    let json_str = fs::read_to_string("inputmapping.json")
-        .expect("Failed to read JSON file");
-    let parsed: MappingFile = serde_json::from_str(&json_str)
-        .expect("Failed to parse JSON into mapping structure");
-    parsed.mappings
-});
-
-pub fn get_object(input: &str) -> Option<&str> {
-    INPUTMAPPING.get(input).map(|entry| entry.object.as_str())
-}
-
-pub fn get_order(input: &str) -> Option<&str> {
-    INPUTMAPPING.get(input).map(|entry| entry.order.as_str())
-}
-
+use axum::extract::State;
+use axum::{extract::Query, response::IntoResponse, routing::get, Router};
 
 use std::borrow::ToOwned;
 
@@ -84,22 +27,37 @@ use matrix_sdk::{
     Client, RoomState,
 };
 
+use matrix_sdk::encryption::secret_storage::SecretStore;
 use matrix_sdk::ruma::events::room::message::{
     MessageType, OriginalSyncRoomMessageEvent, RoomMessageEventContent,
 };
-use matrix_sdk::encryption::secret_storage::SecretStore;
 
 use tracing::Level;
-use tracing_subscriber::filter::{filter_fn, FilterExt};
+use tracing_subscriber::filter::filter_fn;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{filter, Layer};
 
-use serde;
-
-use pulldown_cmark::{Parser, Options, html, Event, Tag};
+use pulldown_cmark::{html, Event, Options, Parser, Tag};
 
 const BWI_TARGET: &str = "BWI";
+static RTC_RUNTIME: OnceLock<Arc<RtcLiveKitRuntime>> = OnceLock::new();
+static BOT_CONFIG: OnceLock<BotConfig::Config> = OnceLock::new();
+
+fn bot_config() -> &'static BotConfig::Config {
+    BOT_CONFIG.get().expect("bot config not initialized; call init_bot_config() first")
+}
+
+fn init_bot_config() -> anyhow::Result<&'static BotConfig::Config> {
+    if let Some(config) = BOT_CONFIG.get() {
+        return Ok(config);
+    }
+
+    let config = BotConfig::Config::from_env()?;
+    let _ = BOT_CONFIG.set(config);
+
+    BOT_CONFIG.get().ok_or_else(|| anyhow!("failed to initialize bot config"))
+}
 
 #[derive(Deserialize)]
 pub struct SearchResultParams {
@@ -138,54 +96,50 @@ fn markdown_to_plain(markdown: &str) -> String {
 }
 
 fn emoji_to_unicode_codes(s: &str) -> String {
-    s.chars()
-        .map(|c| format!("U+{:04X}", c as u32))
-        .collect::<Vec<_>>()
-        .join(" ")
+    s.chars().map(|c| format!("U+{:04X}", c as u32)).collect::<Vec<_>>().join(" ")
 }
 
-async fn send_message_to_bot(client: reqwest::Client,  message: String) -> Result<String, Box<dyn std::error::Error>> {
-    let mut params = HashMap::new();
-    let mut url =  Url::parse(&BotConfig::BOTCONFIG.webserver_send)?;
+async fn send_message_to_bot(
+    client: reqwest::Client,
+    message: String,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let mut params = std::collections::HashMap::new();
+    let mut url = Url::parse(&bot_config().webserver_send)?;
     let mut isKill = false;
 
     match InputMapping::get_order(&message) {
         Some(order) => {
             if order.eq("kill") {
-                url.path_segments_mut()
-                    .expect("cannot be base")
-                    .push("jetbot_kill");
+                url.path_segments_mut().expect("cannot be base").push("jetbot_kill");
                 isKill = true;
             } else {
-                url.path_segments_mut()
-                    .expect("cannot be base")
-                    .push("jetbot_async");
+                url.path_segments_mut().expect("cannot be base").push("jetbot_async");
 
                 match InputMapping::get_object(&message) {
                     Some(object) => {
-                        params.insert( "order", order);
+                        params.insert("order", order);
                         params.insert("object", object);
                     }
                     None => {
-                        params.insert( "order", order);
+                        params.insert("order", order);
                         println!("Send parameterless order {}", order);
                     }
                 }
             }
-
         }
         None => {
-            eprintln!("Error: No mapping found for input: {} Unicode: {}", &message, emoji_to_unicode_codes(&message));
+            eprintln!(
+                "Error: No mapping found for input: {} Unicode: {}",
+                &message,
+                emoji_to_unicode_codes(&message)
+            );
         }
     }
 
     if isKill == true || !params.is_empty() {
         println!("BOT::send_to_bot {}", &url);
 
-        let response = client.get(url)
-            .query(&params)
-            .send().await?
-            .text().await?;
+        let _response = client.get(url).query(&params).send().await?.text().await?;
 
         println!("BOT::send_message_to_bot for {}", &message);
     }
@@ -197,8 +151,8 @@ async fn on_room_message(event: OriginalSyncRoomMessageEvent, room: Room, client
     // First, we need to unpack the message: We only want messages from rooms we are
     // still in and that are regular text messages - ignoring everything else.
 
-    let room_in_id = BotConfig::BOTCONFIG.room_in_id.parse::<matrix_sdk::ruma::OwnedRoomId>().expect("Invalid Room In ID");
-    let room_out_id = BotConfig::BOTCONFIG.room_out_id.parse::<matrix_sdk::ruma::OwnedRoomId>().expect("Invalid Room Out ID");
+    let room_in_id = bot_config().room_in_id.parse::<OwnedRoomId>().expect("Invalid Room In ID");
+    let room_out_id = bot_config().room_out_id.parse::<OwnedRoomId>().expect("Invalid Room Out ID");
 
     if room.state() != RoomState::Joined {
         return;
@@ -211,16 +165,14 @@ async fn on_room_message(event: OriginalSyncRoomMessageEvent, room: Room, client
     }
 
     // for now we listen to text messages
-    let MessageType::Text(text_content) = event.content.msgtype else {
-        return
-    };
+    let MessageType::Text(text_content) = event.content.msgtype else { return };
 
     // only listen if we are mentioned
-    if BotConfig::BOTCONFIG.on_mention_only == true {
+    if bot_config().on_mention_only == true {
         match event.content.mentions {
             Some(mentions) => {
                 let user_ids = mentions.user_ids;
-                let my_user_id = BotConfig::BOTCONFIG.username.to_owned();
+                let my_user_id = client.user_id().map(ToString::to_string).unwrap_or_default();
 
                 let mut isMentioned = false;
                 for item in &user_ids {
@@ -235,12 +187,12 @@ async fn on_room_message(event: OriginalSyncRoomMessageEvent, room: Room, client
 
                 if isMentioned == false {
                     println!("BOT:: Its Not me");
-                    return
+                    return;
                 }
             }
             None => {
                 println!("BOT::No Mentions");
-                return
+                return;
             }
         }
     }
@@ -253,25 +205,39 @@ async fn on_room_message(event: OriginalSyncRoomMessageEvent, room: Room, client
     if let Some((_, command_message)) = message.split_once(':') {
         let cleaned_message = command_message.trim().to_string();
 
-        let reqwest_client = reqwest::Client::new();
+        if cleaned_message == "🎥" {
+            if let Some(runtime) = RTC_RUNTIME.get() {
+                if let Err(err) = runtime.set_call_active(true).await {
+                    eprintln!("Error activating rtc call: {err:#}");
+                }
+            } else {
+                eprintln!("RTC runtime not initialized; cannot activate call");
+            }
+        } else {
+            let reqwest_client = reqwest::Client::new();
 
-        match send_message_to_bot(reqwest_client, cleaned_message).await {
-            Ok(response) => println!("Response: {}", response),
-            Err(err) => eprintln!("Error: {}", err),
+            match send_message_to_bot(reqwest_client, cleaned_message).await {
+                Ok(response) => println!("Response: {}", response),
+                Err(err) => eprintln!("Error: {}", err),
+            }
         }
     }
 
-    if BotConfig::BOTCONFIG.echo_commands == true {
-        let mut formatted_answer = String::new();
+    if bot_config().echo_commands == true {
         if let Some(room_output) = client.get_room(&room_out_id) {
-            if message.eq("left") || message.eq("right") || message.eq("forward") || message.eq("back") {
-                formatted_answer = format!("order: *{}*", message);
+            let formatted_answer = if message.eq("left")
+                || message.eq("right")
+                || message.eq("forward")
+                || message.eq("back")
+            {
+                format!("order: *{}*", message)
             } else {
-                formatted_answer = format!("search: *{}*", message);
-            }
+                format!("search: *{}*", message)
+            };
 
             let html_answer = markdown_to_html(&formatted_answer);
-            let content_output = RoomMessageEventContent::text_html(&formatted_answer, &html_answer);
+            let content_output =
+                RoomMessageEventContent::text_html(&formatted_answer, &html_answer);
             room_output.send(content_output).await.unwrap();
         }
     }
@@ -280,32 +246,93 @@ async fn on_room_message(event: OriginalSyncRoomMessageEvent, room: Room, client
 }
 
 async fn login(
+    homeserver_url: &str,
     username: &str,
     password: &str,
+    device_id: Option<&str>,
+    store_dir: Option<&std::path::Path>,
+    initial_device_display_name: &str,
 ) -> anyhow::Result<Client> {
-    // First, we set up the client.
+    let mut client_builder = Client::builder().homeserver_url(homeserver_url);
 
-    // Note that when encryption is enabled, you should use a persistent store to be
-    // able to restore the session with a working encryption setup.
-    // See the `persist_session` example.
+    if let Some(store_dir) = store_dir {
+        #[cfg(feature = "sqlite")]
+        {
+            client_builder = client_builder.sqlite_store(store_dir, None);
+        }
+        #[cfg(not(feature = "sqlite"))]
+        {
+            let _ = store_dir;
+            warn!("sqlite feature disabled; crypto store will be in-memory.");
+        }
+    }
 
-    let client = Client::builder()
-        // We use the convenient client builder to set our custom homeserver URL on it.
-        .homeserver_url(&BotConfig::BOTCONFIG.home_server)
-        .build()
-        .await?;
+    let client = client_builder.build().await.context("build Matrix client")?;
 
-    // Then let's log that client in
-    client
+    let mut login_builder = client
         .matrix_auth()
         .login_username(username, password)
-        .initial_device_display_name("getting started bot")
-        .await?;
+        .initial_device_display_name(initial_device_display_name);
+
+    if let Some(device_id) = device_id {
+        login_builder = login_builder.device_id(device_id);
+    }
+
+    login_builder.send().await.context("login Matrix user")?;
 
     // It worked!
     println!("logged in as {username}");
 
     Ok(client)
+}
+
+fn prepare_sqlite_store_dir(store_dir: &std::path::Path) -> anyhow::Result<()> {
+    if store_dir.is_file() {
+        warn!(
+            store_path = %store_dir.display(),
+            "Removing file that conflicts with sqlite store directory."
+        );
+        fs::remove_file(store_dir).context("remove sqlite store file")?;
+    }
+    fs::create_dir_all(store_dir).context("create crypto store directory")?;
+
+    let legacy_store_path = store_dir.join("matrix-sdk.sqlite");
+    if legacy_store_path.exists() {
+        warn!(
+            store_path = %legacy_store_path.display(),
+            "Removing legacy sqlite file path."
+        );
+        if legacy_store_path.is_dir() {
+            fs::remove_dir_all(&legacy_store_path).context("remove legacy sqlite directory")?;
+        } else {
+            fs::remove_file(&legacy_store_path).context("remove legacy sqlite file")?;
+        }
+    }
+
+    for sqlite_file in [
+        "matrix-sdk-state.sqlite3",
+        "matrix-sdk-crypto.sqlite3",
+        "matrix-sdk-event-cache.sqlite3",
+        "matrix-sdk-media.sqlite3",
+    ] {
+        let db_path = store_dir.join(sqlite_file);
+        if db_path.is_file() {
+            let header = fs::read(&db_path)
+                .context("read sqlite header")?
+                .into_iter()
+                .take(16)
+                .collect::<Vec<_>>();
+            if header != b"SQLite format 3\0" {
+                warn!(
+                    store_path = %db_path.display(),
+                    "Removing invalid sqlite store file."
+                );
+                fs::remove_file(&db_path).context("remove invalid sqlite file")?;
+            }
+        }
+    }
+
+    Ok(())
 }
 
 async fn sync(client: Client) -> anyhow::Result<()> {
@@ -316,9 +343,11 @@ async fn sync(client: Client) -> anyhow::Result<()> {
 
     // now that we've synced, let's attach a handler for incoming room messages, so
     // we can react on it
-    client.add_event_handler(|event: OriginalSyncRoomMessageEvent, room: Room, client: Client| async move {
-        on_room_message(event, room, client).await;
-    });
+    client.add_event_handler(
+        |event: OriginalSyncRoomMessageEvent, room: Room, client: Client| async move {
+            on_room_message(event, room, client).await;
+        },
+    );
 
     // since we called `sync_once` before we entered our sync loop we must pass
     // that sync token to `sync`
@@ -375,22 +404,20 @@ async fn setup_webserver(state: AppState::AppState) {
         .with_state(state);
 
     // run it
-    let listener = tokio::net::TcpListener::bind(&BotConfig::BOTCONFIG.webserver_spawn)
-        .await
-        .unwrap();
+    let listener = tokio::net::TcpListener::bind(&bot_config().webserver_spawn).await.unwrap();
 
     println!("listening on {}", listener.local_addr().unwrap());
     axum::serve(listener, app).await.unwrap();
 }
 
 async fn handle_explore_result(
-        State(state): State<AppState::AppState>,
-        Query(params): Query<ExploreResultParams> )
-            -> impl IntoResponse {
+    State(state): State<AppState::AppState>,
+    Query(params): Query<ExploreResultParams>,
+) -> impl IntoResponse {
     println!("Received Explore");
 
     let matrix_client = state.matrix_client;
-    let room_out_id = BotConfig::BOTCONFIG.room_out_id.parse::<matrix_sdk::ruma::OwnedRoomId>().expect("Invalid Room Out ID");
+    let room_out_id = bot_config().room_out_id.parse::<OwnedRoomId>().expect("Invalid Room Out ID");
 
     if let Some(room_output) = matrix_client.get_room(&room_out_id) {
         let markdown = format!("{}", params.result);
@@ -405,12 +432,12 @@ async fn handle_explore_result(
 
 async fn handle_search_result(
     State(state): State<AppState::AppState>,
-    Query(params): Query<SearchResultParams> )
-    -> impl IntoResponse {
+    Query(params): Query<SearchResultParams>,
+) -> impl IntoResponse {
     println!("Received search");
 
     let matrix_client = state.matrix_client;
-    let room_out_id = BotConfig::BOTCONFIG.room_out_id.parse::<matrix_sdk::ruma::OwnedRoomId>().expect("Invalid Room Out ID");
+    let room_out_id = bot_config().room_out_id.parse::<OwnedRoomId>().expect("Invalid Room Out ID");
 
     if let Some(room_output) = matrix_client.get_room(&room_out_id) {
         let markdown = format!("{}", params.result);
@@ -423,26 +450,17 @@ async fn handle_search_result(
     format!("Received Search: {}", params.result)
 }
 
-
 // End Stuff from Matrix Bot
 
-#[cfg(any(feature = "experimental-widgets", all(feature = "v4l2", target_os = "linux")))]
-use std::sync::{Arc, Mutex};
-
 use anyhow::{anyhow, Context};
-#[cfg(any(feature = "e2ee-per-participant", feature = "e2e-encryption"))]
-use futures_util::StreamExt;
 #[cfg(feature = "experimental-widgets")]
-use matrix_sdk::{
-    ruma::{DeviceId, UserId},
-    widget::{
-        element_call_member_content, element_call_send_event_message, start_element_call_widget,
-        ClientProperties, ElementCallWidget, ElementCallWidgetOptions, EncryptionSystem, Intent,
-    },
+use matrix_sdk::widget::{
+    element_call_member_content, element_call_send_event_message, start_element_call_widget,
+    ClientProperties, ElementCallWidget, ElementCallWidgetOptions, EncryptionSystem, Intent,
 };
 #[cfg(all(feature = "v4l2", target_os = "linux"))]
 use matrix_sdk_rtc::LiveKitError;
-use matrix_sdk_rtc::{LiveKitConnector, LiveKitResult};
+use matrix_sdk_rtc::LiveKitResult;
 #[cfg(feature = "e2ee-per-participant")]
 use matrix_sdk_rtc_livekit::livekit::id::ParticipantIdentity;
 #[cfg(feature = "e2ee-per-participant")]
@@ -477,7 +495,7 @@ struct DefaultRoomOptionsProvider;
 
 #[async_trait::async_trait]
 impl LiveKitTokenProvider for EnvLiveKitTokenProvider {
-    async fn token(&self, _room: &matrix_sdk::Room) -> LiveKitResult<String> {
+    async fn token(&self, _room: &Room) -> LiveKitResult<String> {
         Ok(self.token.clone())
     }
 }
@@ -498,28 +516,40 @@ fn v4l2_config_from_env() -> anyhow::Result<()> {
     Ok(())
 }
 
-
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-
-    println!("BOT Config: {} {}", BotConfig::BOTCONFIG.home_server, BotConfig::BOTCONFIG.username);
-
+    let bot_cfg = init_bot_config()?;
     setup_logging(false);
 
     println!("before matrix setup");
 
+    let homeserver_url = required_env("HOMESERVER_URL")?;
+    let username = required_env("MATRIX_USERNAME")?;
+    let password = required_env("MATRIX_PASSWORD")?;
+    let device_id = optional_env("MATRIX_DEVICE_ID");
+    let secret_key = optional_env("MATRIX_RECOVERY_KEY");
+    let store_dir = env::current_dir().context("read current directory")?.join("matrix-sdk-store");
+    prepare_sqlite_store_dir(&store_dir)?;
+
     // our actual runner
-    let client = login( &BotConfig::BOTCONFIG.username, &BotConfig::BOTCONFIG.password).await?;
+    let client = login(
+        &homeserver_url,
+        &username,
+        &password,
+        device_id.as_deref(),
+        Some(&store_dir),
+        "matrix-bot",
+    )
+    .await?;
+
+    let rtc_runtime = Arc::new(run_rtc_livekit_join().await?);
+    let _ = RTC_RUNTIME.set(rtc_runtime.clone());
 
     println!("after matrix setup");
 
-    let shared_state = AppState::AppState {
-        matrix_client: client.clone(),
-    };
+    let shared_state = AppState::AppState { matrix_client: client.clone(), rtc_runtime };
 
-    let secret_store =
-        client.encryption().secret_storage().open_secret_store(&BotConfig::BOTCONFIG.secretkey).await?;
-
+    let secret_store = client.encryption().secret_storage().open_secret_store(secret_key.as_deref().unwrap()).await?;
     import_known_secrets(&client, secret_store).await?;
 
     println!("before webserver setup");
@@ -528,7 +558,7 @@ async fn main() -> anyhow::Result<()> {
 
     println!("after webserver setup");
 
-    sync(client).await;
+    sync(client).await?;
 
     Ok(())
 }
@@ -539,7 +569,7 @@ async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
 
     Ok(())
-}    
+}
 
 
     let rtc = run_rtc_livekit_join().await?;
@@ -577,70 +607,17 @@ async fn run_rtc_livekit_join() -> anyhow::Result<RtcLiveKitRuntime> {
     let v4l2_config = v4l2_config_from_env().context("read V4L2 config")?;
 
     let store_dir = env::current_dir().context("read current directory")?.join("matrix-sdk-store");
-    if store_dir.is_file() {
-        warn!(
-            store_path = %store_dir.display(),
-            "Removing file that conflicts with sqlite store directory."
-        );
-        fs::remove_file(&store_dir).context("remove sqlite store file")?;
-    }
-    fs::create_dir_all(&store_dir).context("create crypto store directory")?;
+    prepare_sqlite_store_dir(&store_dir)?;
 
-    let legacy_store_path = store_dir.join("matrix-sdk.sqlite");
-    if legacy_store_path.exists() {
-        warn!(
-            store_path = %legacy_store_path.display(),
-            "Removing legacy sqlite file path."
-        );
-        if legacy_store_path.is_dir() {
-            fs::remove_dir_all(&legacy_store_path).context("remove legacy sqlite directory")?;
-        } else {
-            fs::remove_file(&legacy_store_path).context("remove legacy sqlite file")?;
-        }
-    }
-
-    for sqlite_file in [
-        "matrix-sdk-state.sqlite3",
-        "matrix-sdk-crypto.sqlite3",
-        "matrix-sdk-event-cache.sqlite3",
-        "matrix-sdk-media.sqlite3",
-    ] {
-        let db_path = store_dir.join(sqlite_file);
-        if db_path.is_file() {
-            let header = fs::read(&db_path)
-                .context("read sqlite header")?
-                .into_iter()
-                .take(16)
-                .collect::<Vec<_>>();
-            if header != b"SQLite format 3\0" {
-                warn!(
-                    store_path = %db_path.display(),
-                    "Removing invalid sqlite store file."
-                );
-                fs::remove_file(&db_path).context("remove invalid sqlite file")?;
-            }
-        }
-    }
-
-    let mut client_builder = Client::builder().homeserver_url(homeserver_url);
-
-    #[cfg(feature = "sqlite")]
-    {
-        client_builder = client_builder.sqlite_store(store_dir, None);
-    }
-    #[cfg(not(feature = "sqlite"))]
-    {
-        let _ = &store_path;
-        warn!("sqlite feature disabled; crypto store will be in-memory.");
-    }
-
-    let client = client_builder.build().await.context("build Matrix client")?;
-
-    let mut login_builder = client.matrix_auth().login_username(&username, &password);
-    if let Some(device_id) = device_id.as_deref() {
-        login_builder = login_builder.device_id(device_id);
-    }
-    login_builder.send().await.context("login Matrix user")?;
+    let client = login(
+        &homeserver_url,
+        &username,
+        &password,
+        device_id.as_deref(),
+        Some(&store_dir),
+        "rtc-livekit-join",
+    )
+    .await?;
 
     let room_id_or_alias = RoomOrAliasId::parse(room_id_or_alias).context("parse ROOM_ID")?;
     let via_servers = via_servers_from_env().context("parse VIA_SERVERS")?;
@@ -837,7 +814,7 @@ async fn run_rtc_livekit_join() -> anyhow::Result<RtcLiveKitRuntime> {
 }
 
 struct RtcLiveKitRuntime {
-    room: matrix_sdk::Room,
+    room: Room,
     service_url: String,
     #[cfg(feature = "experimental-widgets")]
     widget: Option<ElementCallWidget>,
@@ -919,7 +896,7 @@ fn retry_seconds_from_env(name: &str, default: u64) -> u64 {
 }
 
 #[cfg(feature = "e2ee-per-participant")]
-fn spawn_periodic_e2ee_key_resend(room: matrix_sdk::Room, context: PerParticipantE2eeContext) {
+fn spawn_periodic_e2ee_key_resend(room: Room, context: PerParticipantE2eeContext) {
     let interval_secs = retry_seconds_from_env("PER_PARTICIPANT_KEY_RESEND_SECS", 0);
     if interval_secs == 0 {
         return;
@@ -943,11 +920,11 @@ fn spawn_periodic_e2ee_key_resend(room: matrix_sdk::Room, context: PerParticipan
 }
 
 #[cfg(not(feature = "e2ee-per-participant"))]
-fn spawn_periodic_e2ee_key_resend(_room: matrix_sdk::Room, _context: ()) {}
+fn spawn_periodic_e2ee_key_resend(_room: Room, _context: ()) {}
 
 #[cfg(feature = "experimental-widgets")]
 async fn publish_call_membership_via_widget(
-    room: matrix_sdk::Room,
+    room: Room,
     widget: &ElementCallWidget,
     service_url: &str,
 ) -> anyhow::Result<()> {
@@ -1125,7 +1102,7 @@ fn register_room_message_key_probe_handler(
 }
 
 struct DriverState {
-    room: matrix_sdk::Room,
+    room: Room,
     #[cfg(all(feature = "v4l2", target_os = "linux"))]
     v4l2_config: Option<V4l2Config>,
     #[cfg(all(feature = "v4l2", target_os = "linux"))]
@@ -1135,7 +1112,7 @@ struct DriverState {
 }
 
 fn build_driver_state(
-    room: matrix_sdk::Room,
+    room: Room,
     #[cfg(all(feature = "v4l2", target_os = "linux"))] v4l2_config: Option<V4l2Config>,
     #[cfg(feature = "e2ee-per-participant")] e2ee_context: Option<PerParticipantE2eeContext>,
 ) -> DriverState {

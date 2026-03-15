@@ -1,12 +1,12 @@
 use once_cell::sync::Lazy;
+use serde::Deserialize;
 use std::collections::HashMap;
 use std::fs;
-use serde::Deserialize;
 
 #[derive(Debug, Deserialize)]
 pub struct MappingEntry {
     pub object: String,
-    pub order: String
+    pub order: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -15,10 +15,9 @@ struct MappingFile {
 }
 
 pub static INPUTMAPPING: Lazy<HashMap<String, MappingEntry>> = Lazy::new(|| {
-    let json_str = fs::read_to_string("inputmapping.json")
-        .expect("Failed to read JSON file");
-    let parsed: MappingFile = serde_json::from_str(&json_str)
-        .expect("Failed to parse JSON into mapping structure");
+    let json_str = fs::read_to_string("inputmapping.json").expect("Failed to read JSON file");
+    let parsed: MappingFile =
+        serde_json::from_str(&json_str).expect("Failed to parse JSON into mapping structure");
     parsed.mappings
 });
 

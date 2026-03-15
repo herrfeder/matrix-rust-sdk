@@ -1,26 +1,40 @@
-use once_cell::sync::Lazy;
-use serde::Deserialize;
-use std::fs;
-use std::sync::OnceLock;
+use anyhow::{anyhow, Context};
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct Config {
-    pub home_server: String,
-    pub username: String,
-    pub password: String,
-    pub secretkey: String,
     pub room_in_id: String,
     pub room_out_id: String,
     pub webserver_send: String,
     pub webserver_spawn: String,
+    pub secret_key: Option<String>,
     pub echo_commands: bool,
-    pub on_mention_only: bool
+    pub on_mention_only: bool,
 }
 
-// Lazy static instance
-pub static BOTCONFIG: Lazy<Config> = Lazy::new(|| {
-    let data = fs::read_to_string("botconfig.json")
-        .expect("Failed to read strings.json");
-    serde_json::from_str(&data)
-        .expect("Failed to parse strings.json")
-});
+impl Config {
+    pub fn from_env() -> anyhow::Result<Self> {
+        Ok(Self {
+            room_in_id: required_env("BOT_ROOM_IN_ID")?,
+            room_out_id: required_env("BOT_ROOM_OUT_ID")?,
+            webserver_send: required_env("BOT_WEBSERVER_SEND")?,
+            webserver_spawn: required_env("BOT_WEBSERVER_SPAWN")?,
+            secret_key: optional_env("MATRIX_SECRET_KEY"),
+            echo_commands: bool_env("BOT_ECHO_COMMANDS"),
+            on_mention_only: bool_env("BOT_ON_MENTION_ONLY"),
+        })
+    }
+}
+
+fn required_env(name: &str) -> anyhow::Result<String> {
+    std::env::var(name).with_context(|| anyhow!("missing required env var: {name}"))
+}
+
+fn optional_env(name: &str) -> Option<String> {
+    std::env::var(name).ok().filter(|value| !value.trim().is_empty())
+}
+
+fn bool_env(name: &str) -> bool {
+    optional_env(name).is_some_and(|value| {
+        matches!(value.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on")
+    })
+}
