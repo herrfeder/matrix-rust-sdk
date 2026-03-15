@@ -4,7 +4,11 @@ use std::sync::{Arc, Mutex};
 #[cfg(all(feature = "v4l2", target_os = "linux"))]
 use anyhow::{anyhow, Context};
 #[cfg(all(feature = "v4l2", target_os = "linux"))]
-use matrix_sdk_rtc_livekit::Room;
+use matrix_sdk::{
+    attachment::AttachmentConfig, ruma::events::room::message::TextMessageEventContent,
+    Room as MatrixRoom,
+};
+use matrix_sdk_rtc_livekit::Room as LivekitRoom;
 #[cfg(all(feature = "v4l2", target_os = "linux"))]
 use tracing::{debug, info, warn};
 
@@ -36,6 +40,131 @@ enum V4l2VideoSource {
 const ZMQ_SOURCE_FRAMERATE: u32 = 30;
 
 #[cfg(all(feature = "v4l2", target_os = "linux"))]
+#[derive(Clone, Debug)]
+struct MotionDetectionConfig {
+    threshold: f32,
+    min_pixels: usize,
+    cooldown: std::time::Duration,
+}
+
+#[cfg(all(feature = "v4l2", target_os = "linux"))]
+impl MotionDetectionConfig {
+    fn from_env() -> Option<Self> {
+        let enabled = optional_env("MOTION_DETECTION_ENABLED").is_some_and(|value| {
+            matches!(value.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on")
+        });
+        if !enabled {
+            return None;
+        }
+
+        let threshold = optional_env("MOTION_DETECTION_PIXEL_THRESHOLD")
+            .and_then(|v| v.parse::<f32>().ok())
+            .unwrap_or(18.0);
+        let min_pixels = optional_env("MOTION_DETECTION_MIN_PIXELS")
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(2_500);
+        let cooldown_secs = optional_env("MOTION_DETECTION_COOLDOWN_SECS")
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(8);
+
+        Some(Self {
+            threshold,
+            min_pixels,
+            cooldown: std::time::Duration::from_secs(cooldown_secs),
+        })
+    }
+}
+
+#[cfg(all(feature = "v4l2", target_os = "linux"))]
+struct MotionDetector {
+    previous_luma: Option<Vec<u8>>,
+    config: MotionDetectionConfig,
+    last_trigger: Option<std::time::Instant>,
+}
+
+#[cfg(all(feature = "v4l2", target_os = "linux"))]
+impl MotionDetector {
+    fn new(config: MotionDetectionConfig) -> Self {
+        Self { previous_luma: None, config, last_trigger: None }
+    }
+
+    fn detect_and_snapshot(
+        &mut self,
+        y_plane: &[u8],
+        stride_y: i32,
+        width: usize,
+        height: usize,
+    ) -> Option<Vec<u8>> {
+        let mut luma = Vec::with_capacity(width * height);
+        for row in 0..height {
+            let start = row * stride_y as usize;
+            luma.extend_from_slice(&y_plane[start..start + width]);
+        }
+
+        let Some(previous) = self.previous_luma.as_ref() else {
+            self.previous_luma = Some(luma);
+            return None;
+        };
+
+        if previous.len() != luma.len() {
+            self.previous_luma = Some(luma);
+            return None;
+        }
+
+        let changed = previous
+            .iter()
+            .zip(luma.iter())
+            .step_by(2)
+            .filter(|(a, b)| {
+                (i16::from(**a) - i16::from(**b)).unsigned_abs() as f32 >= self.config.threshold
+            })
+            .count();
+
+        self.previous_luma = Some(luma.clone());
+
+        if changed < self.config.min_pixels {
+            return None;
+        }
+
+        let now = std::time::Instant::now();
+        if self.last_trigger.is_some_and(|last| now.duration_since(last) < self.config.cooldown) {
+            return None;
+        }
+        self.last_trigger = Some(now);
+
+        encode_luma_to_pgm(&luma, width as u32, height as u32).ok()
+    }
+}
+
+#[cfg(all(feature = "v4l2", target_os = "linux"))]
+fn encode_luma_to_pgm(luma: &[u8], width: u32, height: u32) -> anyhow::Result<Vec<u8>> {
+    let mut pgm = format!("P5\n{} {}\n255\n", width, height).into_bytes();
+    pgm.extend_from_slice(luma);
+    Ok(pgm)
+}
+
+#[cfg(all(feature = "v4l2", target_os = "linux"))]
+async fn motion_reporter_task(
+    matrix_room: MatrixRoom,
+    mut rx: tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
+) {
+    while let Some(image) = rx.recv().await {
+        let caption = TextMessageEventContent::plain("Motion detected (PGM grayscale snapshot)");
+        if let Err(err) = matrix_room
+            .send_attachment(
+                "motion.pgm",
+                &mime::APPLICATION_OCTET_STREAM,
+                image,
+                AttachmentConfig::new().caption(Some(caption)),
+            )
+            .await
+        {
+            warn!(?err, "failed to send motion detection screenshot");
+        }
+    }
+}
+
+#[cfg(all(feature = "v4l2", target_os = "linux"))]
 #[derive(Debug)]
 pub(crate) struct V4l2PublishError(pub(crate) anyhow::Error);
 
@@ -51,11 +180,12 @@ impl std::error::Error for V4l2PublishError {}
 
 #[cfg(all(feature = "v4l2", target_os = "linux"))]
 pub(crate) struct V4l2CameraPublisher {
-    room: Arc<Room>,
+    room: Arc<LivekitRoom>,
     track: matrix_sdk_rtc_livekit::livekit::track::LocalVideoTrack,
     stop_tx: Option<std::sync::mpsc::Sender<()>>,
     task: Option<tokio::task::JoinHandle<anyhow::Result<()>>>,
     stdin_overlay_task: Option<tokio::task::JoinHandle<()>>,
+    motion_report_task: Option<tokio::task::JoinHandle<()>>,
 }
 
 #[cfg(all(feature = "v4l2", target_os = "linux"))]
@@ -86,7 +216,11 @@ enum ZmqPayloadEncoding {
 
 #[cfg(all(feature = "v4l2", target_os = "linux"))]
 impl V4l2CameraPublisher {
-    pub(crate) async fn start(room: Arc<Room>, config: V4l2Config) -> anyhow::Result<Self> {
+    pub(crate) async fn start(
+        room: Arc<LivekitRoom>,
+        matrix_room: MatrixRoom,
+        config: V4l2Config,
+    ) -> anyhow::Result<Self> {
         use matrix_sdk_rtc_livekit::livekit::options::{TrackPublishOptions, VideoCodec};
         use matrix_sdk_rtc_livekit::livekit::track::{LocalTrack, TrackSource};
         use matrix_sdk_rtc_livekit::livekit::webrtc::prelude::RtcVideoSource;
@@ -117,6 +251,13 @@ impl V4l2CameraPublisher {
             .await
             .context("publish V4L2 camera track")?;
 
+        let (motion_tx, motion_rx) = tokio::sync::mpsc::unbounded_channel();
+        let motion_config = MotionDetectionConfig::from_env();
+        if motion_config.is_some() {
+            info!("motion detection enabled for V4L2 publisher");
+        }
+        let motion_report_task = tokio::spawn(motion_reporter_task(matrix_room, motion_rx));
+
         let (stop_tx, stop_rx) = std::sync::mpsc::channel();
         let task = tokio::task::spawn_blocking(move || match capture_mode {
             V4l2CaptureMode::Camera { mut device, pixel_format } => run_v4l2_capture_loop(
@@ -126,6 +267,8 @@ impl V4l2CameraPublisher {
                 rtc_source,
                 stop_rx,
                 text_overlay,
+                motion_config,
+                motion_tx,
             ),
             V4l2CaptureMode::TestRedFrames => {
                 run_generated_red_capture_loop(resolution, rtc_source, stop_rx)
@@ -139,6 +282,8 @@ impl V4l2CameraPublisher {
                     pixel_format,
                     payload_encoding,
                     text_overlay,
+                    motion_config,
+                    motion_tx,
                 )
             }
         });
@@ -149,6 +294,7 @@ impl V4l2CameraPublisher {
             stop_tx: Some(stop_tx),
             task: Some(task),
             stdin_overlay_task: Some(stdin_overlay_task),
+            motion_report_task: Some(motion_report_task),
         })
     }
 
@@ -159,6 +305,9 @@ impl V4l2CameraPublisher {
         }
         if let Some(stdin_overlay_task) = self.stdin_overlay_task.take() {
             stdin_overlay_task.abort();
+        }
+        if let Some(motion_report_task) = self.motion_report_task.take() {
+            motion_report_task.abort();
         }
         if let Some(task) = self.task.take() {
             let _ = task.await?;
@@ -180,6 +329,9 @@ impl Drop for V4l2CameraPublisher {
         }
         if let Some(stdin_overlay_task) = self.stdin_overlay_task.take() {
             stdin_overlay_task.abort();
+        }
+        if let Some(motion_report_task) = self.motion_report_task.take() {
+            motion_report_task.abort();
         }
         if let Some(task) = self.task.take() {
             task.abort();
@@ -297,6 +449,8 @@ fn run_v4l2_capture_loop(
     rtc_source: matrix_sdk_rtc_livekit::livekit::webrtc::video_source::native::NativeVideoSource,
     stop_rx: std::sync::mpsc::Receiver<()>,
     text_overlay: Arc<Mutex<TextOverlayState>>,
+    motion_config: Option<MotionDetectionConfig>,
+    motion_tx: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
 ) -> anyhow::Result<()> {
     use matrix_sdk_rtc_livekit::livekit::webrtc::native::yuv_helper;
     use matrix_sdk_rtc_livekit::livekit::webrtc::prelude::{I420Buffer, VideoFrame, VideoRotation};
@@ -330,6 +484,7 @@ fn run_v4l2_capture_loop(
         buffer: I420Buffer::new(resolution.width, resolution.height),
         timestamp_us: 0,
     };
+    let mut motion_detector = motion_config.map(MotionDetector::new);
 
     loop {
         if stop_rx.try_recv().is_ok() {
@@ -378,6 +533,19 @@ fn run_v4l2_capture_loop(
 
         if let Ok(mut overlay) = text_overlay.lock() {
             overlay.tick_and_draw(&resolution, dst_y, stride_y, dst_u, stride_u, dst_v, stride_v);
+        }
+
+        if let Some(detector) = motion_detector.as_mut() {
+            if let Some(jpeg) = detector.detect_and_snapshot(
+                dst_y,
+                stride_y,
+                resolution.width as usize,
+                resolution.height as usize,
+            ) {
+                if motion_tx.send(jpeg).is_err() {
+                    warn!("motion report channel closed");
+                }
+            }
         }
 
         frame.timestamp_us = start.elapsed().as_micros() as i64;
@@ -443,6 +611,8 @@ fn run_zmq_capture_loop(
     pixel_format: ZmqPixelFormat,
     payload_encoding: ZmqPayloadEncoding,
     text_overlay: Arc<Mutex<TextOverlayState>>,
+    motion_config: Option<MotionDetectionConfig>,
+    motion_tx: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
 ) -> anyhow::Result<()> {
     use matrix_sdk_rtc_livekit::livekit::webrtc::prelude::{I420Buffer, VideoFrame, VideoRotation};
 
@@ -486,6 +656,7 @@ fn run_zmq_capture_loop(
         buffer: I420Buffer::new(resolution.width, resolution.height),
         timestamp_us: 0,
     };
+    let mut motion_detector = motion_config.map(MotionDetector::new);
 
     let frame_duration = std::time::Duration::from_millis(1000 / ZMQ_SOURCE_FRAMERATE as u64);
     let start = std::time::Instant::now();
@@ -610,6 +781,19 @@ fn run_zmq_capture_loop(
 
         if let Ok(mut overlay) = text_overlay.lock() {
             overlay.tick_and_draw(&resolution, dst_y, stride_y, dst_u, stride_u, dst_v, stride_v);
+        }
+
+        if let Some(detector) = motion_detector.as_mut() {
+            if let Some(jpeg) = detector.detect_and_snapshot(
+                dst_y,
+                stride_y,
+                resolution.width as usize,
+                resolution.height as usize,
+            ) {
+                if motion_tx.send(jpeg).is_err() {
+                    warn!("motion report channel closed");
+                }
+            }
         }
 
         frame.timestamp_us = start.elapsed().as_micros() as i64;

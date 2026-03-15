@@ -1152,9 +1152,10 @@ async fn set_video_stream_enabled(
                     (room_handle, state.v4l2_config.as_ref().cloned())
                 {
                     info!(device = %config.device, "starting V4L2 camera publisher");
-                    let publisher = V4l2CameraPublisher::start(room_handle, config)
-                        .await
-                        .map_err(|err| LiveKitError::connector(V4l2PublishError(err)))?;
+                    let publisher =
+                        V4l2CameraPublisher::start(room_handle, state.room.clone(), config)
+                            .await
+                            .map_err(|err| LiveKitError::connector(V4l2PublishError(err)))?;
                     state.v4l2_publisher = Some(publisher);
                 }
             }
