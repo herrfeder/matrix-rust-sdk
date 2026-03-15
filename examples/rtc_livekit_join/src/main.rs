@@ -77,15 +77,17 @@ pub fn get_order(input: &str) -> Option<&str> {
 
 use std::borrow::ToOwned;
 
-#[cfg(feature = "e2e-encryption")]
 use matrix_sdk::{
     config::SyncSettings,
     event_handler::EventHandlerDropGuard,
+    room::Room,
     ruma::{OwnedRoomId, OwnedServerName, RoomId, RoomOrAliasId, ServerName},
     Client, RoomState,
 };
 
-use matrix_sdk::ruma::events::room::message::{MessageType, OriginalSyncRoomMessageEvent};
+use matrix_sdk::ruma::events::room::message::{
+    MessageType, OriginalSyncRoomMessageEvent, RoomMessageEventContent,
+};
 use matrix_sdk::encryption::secret_storage::SecretStore;
 
 use reqwest;
@@ -317,7 +319,9 @@ async fn sync(client: Client) -> anyhow::Result<()> {
 
     // now that we've synced, let's attach a handler for incoming room messages, so
     // we can react on it
-    client.add_event_handler(on_room_message);
+    client.add_event_handler(|event: OriginalSyncRoomMessageEvent, room: Room, client: Client| async move {
+        on_room_message(event, room, client).await;
+    });
 
     // since we called `sync_once` before we entered our sync loop we must pass
     // that sync token to `sync`
