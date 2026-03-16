@@ -525,7 +525,10 @@ impl LiveKitRoomOptionsProvider for DefaultRoomOptionsProvider {
 #[cfg(all(feature = "v4l2", target_os = "linux"))]
 mod videosource;
 #[cfg(all(feature = "v4l2", target_os = "linux"))]
-use videosource::{v4l2_config_from_env, V4l2CameraPublisher, V4l2Config, V4l2PublishError};
+use videosource::{
+    start_background_motion_detector, v4l2_config_from_env, V4l2CameraPublisher, V4l2Config,
+    V4l2PublishError,
+};
 
 #[cfg(not(all(feature = "v4l2", target_os = "linux")))]
 fn v4l2_config_from_env() -> anyhow::Result<()> {
@@ -557,6 +560,13 @@ async fn main() -> anyhow::Result<()> {
         "matrix-bot",
     )
     .await?;
+
+    #[cfg(all(feature = "v4l2", target_os = "linux"))]
+    if let Some(room) = client
+        .get_room(&bot_config().room_out_id.parse::<OwnedRoomId>().expect("Invalid Room Out ID"))
+    {
+        start_background_motion_detector(room, v4l2_config_from_env()?).await?;
+    }
 
     println!("after matrix setup");
 

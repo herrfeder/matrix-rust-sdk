@@ -76,6 +76,11 @@ impl MotionDetectionConfig {
 }
 
 #[cfg(all(feature = "v4l2", target_os = "linux"))]
+fn bool_env(name: &str) -> bool {
+    optional_env(name).is_some_and(|value| {
+        matches!(value.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on")
+    })
+}
 struct MotionDetector {
     previous_luma: Option<Vec<u8>>,
     config: MotionDetectionConfig,
@@ -88,18 +93,8 @@ impl MotionDetector {
         Self { previous_luma: None, config, last_trigger: None }
     }
 
-    fn detect_and_snapshot(
-        &mut self,
-        y_plane: &[u8],
-        stride_y: u32,
-        width: usize,
-        height: usize,
-    ) -> Option<Vec<u8>> {
-        let mut luma = Vec::with_capacity(width * height);
-        for row in 0..height {
-            let start = row * stride_y as usize;
-            luma.extend_from_slice(&y_plane[start..start + width]);
-        }
+    fn detect_and_snapshot(&mut self, luma: &[u8], width: usize, height: usize) -> Option<Vec<u8>> {
+        let luma = luma.to_vec();
 
         let Some(previous) = self.previous_luma.as_ref() else {
             self.previous_luma = Some(luma);
@@ -149,11 +144,11 @@ async fn motion_reporter_task(
     mut rx: tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
 ) {
     while let Some(image) = rx.recv().await {
-        let caption = TextMessageEventContent::plain("Motion detected (PGM grayscale snapshot)");
+        let caption = TextMessageEventContent::plain("Motion detected");
         if let Err(err) = matrix_room
             .send_attachment(
-                "motion.pgm",
-                &mime::APPLICATION_OCTET_STREAM,
+                "motion.jpg",
+                &mime::IMAGE_JPEG,
                 image,
                 AttachmentConfig::new().caption(Some(caption)),
             )
@@ -252,7 +247,11 @@ impl V4l2CameraPublisher {
             .context("publish V4L2 camera track")?;
 
         let (motion_tx, motion_rx) = tokio::sync::mpsc::unbounded_channel();
-        let motion_config = MotionDetectionConfig::from_env();
+        let motion_config = if bool_env("MOTION_DETECTION_IN_RTC") {
+            MotionDetectionConfig::from_env()
+        } else {
+            None
+        };
         if motion_config.is_some() {
             info!("motion detection enabled for V4L2 publisher");
         }
@@ -538,7 +537,6 @@ fn run_v4l2_capture_loop(
         if let Some(detector) = motion_detector.as_mut() {
             if let Some(jpeg) = detector.detect_and_snapshot(
                 dst_y,
-                stride_y,
                 resolution.width as usize,
                 resolution.height as usize,
             ) {
@@ -786,7 +784,6 @@ fn run_zmq_capture_loop(
         if let Some(detector) = motion_detector.as_mut() {
             if let Some(jpeg) = detector.detect_and_snapshot(
                 dst_y,
-                stride_y,
                 resolution.width as usize,
                 resolution.height as usize,
             ) {
@@ -1141,6 +1138,92 @@ fn zmq_payload_encoding_from_env() -> anyhow::Result<ZmqPayloadEncoding> {
             Err(anyhow!("invalid V4L2_ZMQ_PAYLOAD_ENCODING '{other}'; expected auto|raw|base64"))
         }
     }
+}
+
+#[cfg(all(feature = "v4l2", target_os = "linux"))]
+pub(crate) async fn start_background_motion_detector(
+    matrix_room: MatrixRoom,
+    config: Option<V4l2Config>,
+) -> anyhow::Result<()> {
+    if !bool_env("MOTION_DETECTION_ENABLED") {
+        return Ok(());
+    }
+
+    let Some(config) = config else {
+        warn!("motion detection enabled but V4L2 is not configured");
+        return Ok(());
+    };
+
+    if !matches!(config.source, V4l2VideoSource::Camera) {
+        warn!("standalone motion detection currently supports only V4L2 camera source");
+        return Ok(());
+    }
+
+    let detector_cfg =
+        MotionDetectionConfig::from_env().context("parse motion detection config")?;
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+    tokio::spawn(motion_reporter_task(matrix_room, rx));
+
+    tokio::task::spawn_blocking(move || {
+        use std::io::Cursor;
+        use v4l::buffer::Type;
+        use v4l::io::mmap::Stream;
+        use v4l::io::traits::CaptureStream;
+        use v4l::video::Capture;
+
+        let mut device =
+            v4l::Device::with_path(&config.device).context("open V4L2 motion device")?;
+        let mut format = device.format().context("read V4L2 motion format")?;
+        if let Some(w) = config.width {
+            format.width = w;
+        }
+        if let Some(h) = config.height {
+            format.height = h;
+        }
+        format.fourcc = v4l::FourCC::new(b"MJPG");
+        let active = device.set_format(&format).context("set MJPG format")?;
+        if &active.fourcc.repr != b"MJPG" {
+            return Err(anyhow!("camera does not support MJPG for standalone motion detection"));
+        }
+
+        let mut detector = MotionDetector::new(detector_cfg);
+        let mut stream = Stream::with_buffers(&device, Type::VideoCapture, 4)
+            .context("start V4L2 motion stream")?;
+
+        loop {
+            let (data, _) = stream.next().context("read motion frame")?;
+            let mut decoder = jpeg_decoder::Decoder::new(Cursor::new(data));
+            let decoded = match decoder.decode() {
+                Ok(decoded) => decoded,
+                Err(_) => continue,
+            };
+            let Some(info) = decoder.info() else { continue };
+            let luma = match info.pixel_format {
+                jpeg_decoder::PixelFormat::L8 => decoded,
+                jpeg_decoder::PixelFormat::RGB24 => {
+                    let mut y = Vec::with_capacity((info.width as usize) * (info.height as usize));
+                    for px in decoded.chunks_exact(3) {
+                        let r = px[0] as f32;
+                        let g = px[1] as f32;
+                        let b = px[2] as f32;
+                        y.push((0.299 * r + 0.587 * g + 0.114 * b).round().clamp(0.0, 255.0) as u8);
+                    }
+                    y
+                }
+                _ => continue,
+            };
+
+            if detector.detect_and_snapshot(&luma, info.width.into(), info.height.into()).is_some()
+            {
+                let _ = tx.send(data.to_vec());
+            }
+        }
+        #[allow(unreachable_code)]
+        anyhow::Ok(())
+    });
+
+    info!("started background standalone motion detector");
+    Ok(())
 }
 
 #[cfg(all(feature = "v4l2", target_os = "linux"))]
