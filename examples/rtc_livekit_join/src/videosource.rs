@@ -1,5 +1,5 @@
 #[cfg(all(feature = "v4l2", target_os = "linux"))]
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 
 #[cfg(all(feature = "v4l2", target_os = "linux"))]
 use anyhow::{anyhow, Context};
@@ -81,6 +81,17 @@ fn bool_env(name: &str) -> bool {
         matches!(value.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on")
     })
 }
+
+#[cfg(all(feature = "v4l2", target_os = "linux"))]
+struct BackgroundMotionRuntime {
+    stop_tx: std::sync::mpsc::Sender<()>,
+    capture_task: tokio::task::JoinHandle<anyhow::Result<()>>,
+    reporter_task: tokio::task::JoinHandle<()>,
+}
+
+#[cfg(all(feature = "v4l2", target_os = "linux"))]
+static BACKGROUND_MOTION_RUNTIME: LazyLock<tokio::sync::Mutex<Option<BackgroundMotionRuntime>>> =
+    LazyLock::new(|| tokio::sync::Mutex::new(None));
 struct MotionDetector {
     previous_luma: Option<Vec<u8>>,
     config: MotionDetectionConfig,
@@ -1141,6 +1152,16 @@ fn zmq_payload_encoding_from_env() -> anyhow::Result<ZmqPayloadEncoding> {
 }
 
 #[cfg(all(feature = "v4l2", target_os = "linux"))]
+pub(crate) async fn stop_background_motion_detector() {
+    let mut guard = BACKGROUND_MOTION_RUNTIME.lock().await;
+    if let Some(runtime) = guard.take() {
+        let _ = runtime.stop_tx.send(());
+        runtime.capture_task.abort();
+        runtime.reporter_task.abort();
+    }
+}
+
+#[cfg(all(feature = "v4l2", target_os = "linux"))]
 pub(crate) async fn start_background_motion_detector(
     matrix_room: MatrixRoom,
     config: Option<V4l2Config>,
@@ -1159,12 +1180,15 @@ pub(crate) async fn start_background_motion_detector(
         return Ok(());
     }
 
+    stop_background_motion_detector().await;
+
     let detector_cfg =
         MotionDetectionConfig::from_env().context("parse motion detection config")?;
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
-    tokio::spawn(motion_reporter_task(matrix_room, rx));
+    let reporter_task = tokio::spawn(motion_reporter_task(matrix_room, rx));
+    let (stop_tx, stop_rx) = std::sync::mpsc::channel();
 
-    tokio::task::spawn_blocking(move || {
+    let capture_task = tokio::task::spawn_blocking(move || {
         use std::io::Cursor;
         use v4l::buffer::Type;
         use v4l::io::mmap::Stream;
@@ -1191,6 +1215,10 @@ pub(crate) async fn start_background_motion_detector(
             .context("start V4L2 motion stream")?;
 
         loop {
+            if stop_rx.try_recv().is_ok() {
+                break;
+            }
+
             let (data, _) = stream.next().context("read motion frame")?;
             let mut decoder = jpeg_decoder::Decoder::new(Cursor::new(data));
             let decoded = match decoder.decode() {
@@ -1221,6 +1249,9 @@ pub(crate) async fn start_background_motion_detector(
         #[allow(unreachable_code)]
         anyhow::Ok(())
     });
+
+    let mut guard = BACKGROUND_MOTION_RUNTIME.lock().await;
+    *guard = Some(BackgroundMotionRuntime { stop_tx, capture_task, reporter_task });
 
     info!("started background standalone motion detector");
     Ok(())

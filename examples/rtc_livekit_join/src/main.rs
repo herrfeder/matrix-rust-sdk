@@ -215,7 +215,28 @@ async fn on_room_message(event: OriginalSyncRoomMessageEvent, room: Room, client
                 }
                 runtime.shutdown_call_session();
                 *runtime_guard = None;
+
+                #[cfg(all(feature = "v4l2", target_os = "linux"))]
+                if let Some(room) = client.get_room(
+                    &bot_config().room_out_id.parse::<OwnedRoomId>().expect("Invalid Room Out ID"),
+                ) {
+                    match v4l2_config_from_env() {
+                        Ok(v4l2_config) => {
+                            if let Err(err) =
+                                start_background_motion_detector(room, v4l2_config).await
+                            {
+                                eprintln!("Error restarting background motion detector: {err:#}");
+                            }
+                        }
+                        Err(err) => {
+                            eprintln!("Error reading V4L2 config for motion detector: {err:#}")
+                        }
+                    }
+                }
             } else {
+                #[cfg(all(feature = "v4l2", target_os = "linux"))]
+                stop_background_motion_detector().await;
+
                 match run_rtc_livekit_join(client.clone()).await {
                     Ok(runtime) => {
                         let runtime = Arc::new(runtime);
@@ -526,8 +547,8 @@ impl LiveKitRoomOptionsProvider for DefaultRoomOptionsProvider {
 mod videosource;
 #[cfg(all(feature = "v4l2", target_os = "linux"))]
 use videosource::{
-    start_background_motion_detector, v4l2_config_from_env, V4l2CameraPublisher, V4l2Config,
-    V4l2PublishError,
+    start_background_motion_detector, stop_background_motion_detector, v4l2_config_from_env,
+    V4l2CameraPublisher, V4l2Config, V4l2PublishError,
 };
 
 #[cfg(not(all(feature = "v4l2", target_os = "linux")))]
