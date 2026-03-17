@@ -186,7 +186,7 @@ async fn on_room_message(event: OriginalSyncRoomMessageEvent, room: Room, client
                 let my_user_id = client.user_id().map(ToString::to_string).unwrap_or_default();
 
                 let mut isMentioned = false;
-                for item in &user_ids {
+                for item in user_ids {
                     println!("BOT::- {}", item);
                     let cleaned = item.to_string();
                     if cleaned.eq(&my_user_id) {
