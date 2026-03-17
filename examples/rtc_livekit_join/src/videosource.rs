@@ -1195,8 +1195,7 @@ pub(crate) async fn start_background_motion_detector(
         use v4l::io::traits::CaptureStream;
         use v4l::video::Capture;
 
-        let mut device =
-            v4l::Device::with_path(&config.device).context("open V4L2 motion device")?;
+        let device = v4l::Device::with_path(&config.device).context("open V4L2 motion device")?;
         let mut format = device.format().context("read V4L2 motion format")?;
         if let Some(w) = config.width {
             format.width = w;

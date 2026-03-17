@@ -180,9 +180,9 @@ async fn on_room_message(event: OriginalSyncRoomMessageEvent, room: Room, client
 
     // only listen if we are mentioned
     if bot_config().on_mention_only == true {
-        match event.content.mentions {
+        match event.content.mentions.as_ref() {
             Some(mentions) => {
-                let user_ids = mentions.user_ids;
+                let user_ids = &mentions.user_ids;
                 let my_user_id = client.user_id().map(ToString::to_string).unwrap_or_default();
 
                 let mut isMentioned = false;
@@ -587,7 +587,7 @@ fn v4l2_config_from_env() -> anyhow::Result<()> {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let bot_cfg = init_bot_config()?;
+    init_bot_config()?;
     setup_logging(false);
 
     println!("before matrix setup");
