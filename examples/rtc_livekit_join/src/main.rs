@@ -148,6 +148,16 @@ async fn send_message_to_bot(
     Ok("Request".to_string())
 }
 
+async fn send_video_status_message(client: &Client, status: &str) {
+    let room_out_id = bot_config().room_out_id.parse::<OwnedRoomId>().expect("Invalid Room Out ID");
+    if let Some(room_output) = client.get_room(&room_out_id) {
+        let content_output = RoomMessageEventContent::text_plain(status);
+        if let Err(err) = room_output.send(content_output).await {
+            eprintln!("Error sending video status message: {err:#}");
+        }
+    }
+}
+
 async fn on_room_message(event: OriginalSyncRoomMessageEvent, room: Room, client: Client) {
     // First, we need to unpack the message: We only want messages from rooms we are
     // still in and that are regular text messages - ignoring everything else.
@@ -207,6 +217,19 @@ async fn on_room_message(event: OriginalSyncRoomMessageEvent, room: Room, client
         let cleaned_message = command_message.trim().to_string();
 
         if cleaned_message == "🎥" {
+            let Some(mentions) = event.content.mentions.as_ref() else {
+                println!("BOT:: ignoring 🎥 because command has no explicit mention target");
+                return;
+            };
+
+            let my_user_id = client.user_id().map(ToString::to_string).unwrap_or_default();
+            let mentions_me = mentions.user_ids.iter().any(|id| id.to_string() == my_user_id);
+            let single_target = mentions.user_ids.len() == 1;
+            if !(mentions_me && single_target) {
+                println!("BOT:: ignoring 🎥 because command is not targeted to exactly this bot");
+                return;
+            }
+
             let mut runtime_guard = RTC_RUNTIME.lock().await;
 
             if let Some(runtime) = runtime_guard.take() {
@@ -218,6 +241,8 @@ async fn on_room_message(event: OriginalSyncRoomMessageEvent, room: Room, client
                     Ok(runtime) => runtime.shutdown().await,
                     Err(runtime) => runtime.shutdown_call_session(),
                 }
+
+                send_video_status_message(&client, "Stop the Video").await;
 
                 #[cfg(all(feature = "v4l2", target_os = "linux"))]
                 if let Some(room) = client.get_room(
@@ -248,6 +273,7 @@ async fn on_room_message(event: OriginalSyncRoomMessageEvent, room: Room, client
                             runtime.shutdown_call_session();
                         } else {
                             *runtime_guard = Some(runtime);
+                            send_video_status_message(&client, "Start the Video").await;
                         }
                     }
                     Err(err) => eprintln!("Error starting rtc runtime: {err:#}"),
