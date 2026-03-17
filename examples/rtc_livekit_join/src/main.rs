@@ -209,12 +209,15 @@ async fn on_room_message(event: OriginalSyncRoomMessageEvent, room: Room, client
         if cleaned_message == "🎥" {
             let mut runtime_guard = RTC_RUNTIME.lock().await;
 
-            if let Some(runtime) = runtime_guard.as_ref() {
+            if let Some(runtime) = runtime_guard.take() {
                 if let Err(err) = runtime.set_call_active(false).await {
                     eprintln!("Error deactivating rtc call: {err:#}");
                 }
-                runtime.shutdown_call_session();
-                *runtime_guard = None;
+
+                match Arc::try_unwrap(runtime) {
+                    Ok(runtime) => runtime.shutdown().await,
+                    Err(runtime) => runtime.shutdown_call_session(),
+                }
 
                 #[cfg(all(feature = "v4l2", target_os = "linux"))]
                 if let Some(room) = client.get_room(
