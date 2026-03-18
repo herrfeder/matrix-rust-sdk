@@ -4,7 +4,7 @@
 
 mod AppState;
 use serde::Deserialize;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, LazyLock, OnceLock};
 use std::{env, fs};
 
 mod BotConfig;
@@ -41,7 +41,8 @@ use tracing_subscriber::{filter, Layer};
 use pulldown_cmark::{html, Event, Options, Parser, Tag};
 
 const BWI_TARGET: &str = "BWI";
-static RTC_RUNTIME: OnceLock<Arc<RtcLiveKitRuntime>> = OnceLock::new();
+static RTC_RUNTIME: LazyLock<tokio::sync::Mutex<Option<Arc<RtcLiveKitRuntime>>>> =
+    LazyLock::new(|| tokio::sync::Mutex::new(None));
 static BOT_CONFIG: OnceLock<BotConfig::Config> = OnceLock::new();
 
 fn bot_config() -> &'static BotConfig::Config {
@@ -147,6 +148,16 @@ async fn send_message_to_bot(
     Ok("Request".to_string())
 }
 
+async fn send_video_status_message(client: &Client, status: &str) {
+    let room_out_id = bot_config().room_out_id.parse::<OwnedRoomId>().expect("Invalid Room Out ID");
+    if let Some(room_output) = client.get_room(&room_out_id) {
+        let content_output = RoomMessageEventContent::text_plain(status);
+        if let Err(err) = room_output.send(content_output).await {
+            eprintln!("Error sending video status message: {err:#}");
+        }
+    }
+}
+
 async fn on_room_message(event: OriginalSyncRoomMessageEvent, room: Room, client: Client) {
     // First, we need to unpack the message: We only want messages from rooms we are
     // still in and that are regular text messages - ignoring everything else.
@@ -169,13 +180,13 @@ async fn on_room_message(event: OriginalSyncRoomMessageEvent, room: Room, client
 
     // only listen if we are mentioned
     if bot_config().on_mention_only == true {
-        match event.content.mentions {
+        match event.content.mentions.as_ref() {
             Some(mentions) => {
-                let user_ids = mentions.user_ids;
+                let user_ids = &mentions.user_ids;
                 let my_user_id = client.user_id().map(ToString::to_string).unwrap_or_default();
 
                 let mut isMentioned = false;
-                for item in &user_ids {
+                for item in user_ids {
                     println!("BOT::- {}", item);
                     let cleaned = item.to_string();
                     if cleaned.eq(&my_user_id) {
@@ -206,12 +217,67 @@ async fn on_room_message(event: OriginalSyncRoomMessageEvent, room: Room, client
         let cleaned_message = command_message.trim().to_string();
 
         if cleaned_message == "🎥" {
-            if let Some(runtime) = RTC_RUNTIME.get() {
-                if let Err(err) = runtime.set_call_active(true).await {
-                    eprintln!("Error activating rtc call: {err:#}");
+            let Some(mentions) = event.content.mentions.as_ref() else {
+                println!("BOT:: ignoring 🎥 because command has no explicit mention target");
+                return;
+            };
+
+            let my_user_id = client.user_id().map(ToString::to_string).unwrap_or_default();
+            let mentions_me = mentions.user_ids.iter().any(|id| id.to_string() == my_user_id);
+            let single_target = mentions.user_ids.len() == 1;
+            if !(mentions_me && single_target) {
+                println!("BOT:: ignoring 🎥 because command is not targeted to exactly this bot");
+                return;
+            }
+
+            let mut runtime_guard = RTC_RUNTIME.lock().await;
+
+            if let Some(runtime) = runtime_guard.take() {
+                if let Err(err) = runtime.set_call_active(false).await {
+                    eprintln!("Error deactivating rtc call: {err:#}");
+                }
+
+                match Arc::try_unwrap(runtime) {
+                    Ok(runtime) => runtime.shutdown().await,
+                    Err(runtime) => runtime.shutdown_call_session(),
+                }
+
+                send_video_status_message(&client, "Stop the Video").await;
+
+                #[cfg(all(feature = "v4l2", target_os = "linux"))]
+                if let Some(room) = client.get_room(
+                    &bot_config().room_out_id.parse::<OwnedRoomId>().expect("Invalid Room Out ID"),
+                ) {
+                    match v4l2_config_from_env() {
+                        Ok(v4l2_config) => {
+                            if let Err(err) =
+                                start_background_motion_detector(room, v4l2_config).await
+                            {
+                                eprintln!("Error restarting background motion detector: {err:#}");
+                            }
+                        }
+                        Err(err) => {
+                            eprintln!("Error reading V4L2 config for motion detector: {err:#}")
+                        }
+                    }
                 }
             } else {
-                eprintln!("RTC runtime not initialized; cannot activate call");
+                #[cfg(all(feature = "v4l2", target_os = "linux"))]
+                stop_background_motion_detector().await;
+
+                match run_rtc_livekit_join(client.clone()).await {
+                    Ok(runtime) => {
+                        let runtime = Arc::new(runtime);
+                        if let Err(err) = runtime.set_call_active(true).await {
+                            eprintln!("Error activating rtc call: {err:#}");
+                            runtime.shutdown_call_session();
+                        } else {
+                            *runtime_guard = Some(runtime);
+                            send_video_status_message(&client, "Start the Video").await;
+                        }
+                    }
+                    Err(err) => eprintln!("Error starting rtc runtime: {err:#}"),
+                }
             }
         } else {
             let reqwest_client = reqwest::Client::new();
@@ -509,7 +575,10 @@ impl LiveKitRoomOptionsProvider for DefaultRoomOptionsProvider {
 #[cfg(all(feature = "v4l2", target_os = "linux"))]
 mod videosource;
 #[cfg(all(feature = "v4l2", target_os = "linux"))]
-use videosource::{v4l2_config_from_env, V4l2CameraPublisher, V4l2Config, V4l2PublishError};
+use videosource::{
+    start_background_motion_detector, stop_background_motion_detector, v4l2_config_from_env,
+    V4l2CameraPublisher, V4l2Config, V4l2PublishError,
+};
 
 #[cfg(not(all(feature = "v4l2", target_os = "linux")))]
 fn v4l2_config_from_env() -> anyhow::Result<()> {
@@ -518,7 +587,7 @@ fn v4l2_config_from_env() -> anyhow::Result<()> {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let bot_cfg = init_bot_config()?;
+    init_bot_config()?;
     setup_logging(false);
 
     println!("before matrix setup");
@@ -542,14 +611,22 @@ async fn main() -> anyhow::Result<()> {
     )
     .await?;
 
-    let rtc_runtime = Arc::new(run_rtc_livekit_join().await?);
-    let _ = RTC_RUNTIME.set(rtc_runtime.clone());
+    #[cfg(all(feature = "v4l2", target_os = "linux"))]
+    if let Some(room) = client
+        .get_room(&bot_config().room_out_id.parse::<OwnedRoomId>().expect("Invalid Room Out ID"))
+    {
+        start_background_motion_detector(room, v4l2_config_from_env()?).await?;
+    }
 
     println!("after matrix setup");
 
-    let shared_state = AppState::AppState { matrix_client: client.clone(), rtc_runtime };
+    let shared_state = AppState::AppState { matrix_client: client.clone() };
 
-    let secret_store = client.encryption().secret_storage().open_secret_store(secret_key.as_deref().unwrap()).await?;
+    let secret_store = client
+        .encryption()
+        .secret_storage()
+        .open_secret_store(secret_key.as_deref().unwrap())
+        .await?;
     import_known_secrets(&client, secret_store).await?;
 
     println!("before webserver setup");
@@ -596,28 +673,11 @@ async fn main() -> anyhow::Result<()> {
 
 */
 
-async fn run_rtc_livekit_join() -> anyhow::Result<RtcLiveKitRuntime> {
-    let homeserver_url = required_env("HOMESERVER_URL")?;
-    let username = required_env("MATRIX_USERNAME")?;
-    let password = required_env("MATRIX_PASSWORD")?;
+async fn run_rtc_livekit_join(client: Client) -> anyhow::Result<RtcLiveKitRuntime> {
     let room_id_or_alias = required_env("ROOM_ID")?;
-    let device_id = optional_env("MATRIX_DEVICE_ID");
     let livekit_service_url_override = optional_env("LIVEKIT_SERVICE_URL");
     let livekit_sfu_get_url = optional_env("LIVEKIT_SFU_GET_URL");
     let v4l2_config = v4l2_config_from_env().context("read V4L2 config")?;
-
-    let store_dir = env::current_dir().context("read current directory")?.join("matrix-sdk-store");
-    prepare_sqlite_store_dir(&store_dir)?;
-
-    let client = login(
-        &homeserver_url,
-        &username,
-        &password,
-        device_id.as_deref(),
-        Some(&store_dir),
-        "rtc-livekit-join",
-    )
-    .await?;
 
     let room_id_or_alias = RoomOrAliasId::parse(room_id_or_alias).context("parse ROOM_ID")?;
     let via_servers = via_servers_from_env().context("parse VIA_SERVERS")?;
@@ -683,13 +743,10 @@ async fn run_rtc_livekit_join() -> anyhow::Result<RtcLiveKitRuntime> {
     let widget: Option<()> = None;
 
     #[cfg(feature = "e2ee-per-participant")]
-    let _to_device_probe_guard = register_any_to_device_probe_handler(&client);
+    let to_device_probe_guard = register_any_to_device_probe_handler(&client);
     #[cfg(feature = "e2ee-per-participant")]
-    let _room_message_probe_guard =
+    let room_message_probe_guard =
         register_room_message_key_probe_handler(&client, room.room_id().to_owned());
-
-    let sync_client = client.clone();
-    let sync_handle = tokio::spawn(async move { sync_client.sync(SyncSettings::new()).await });
 
     let static_livekit_token = optional_env("LIVEKIT_TOKEN");
     let connection_details = resolve_connection_details(
@@ -733,7 +790,7 @@ async fn run_rtc_livekit_join() -> anyhow::Result<RtcLiveKitRuntime> {
         }
     }
     #[cfg(feature = "e2ee-per-participant")]
-    let _e2ee_to_device_guard = e2ee_context.as_ref().map(|context| {
+    let e2ee_to_device_guard = e2ee_context.as_ref().map(|context| {
         register_e2ee_to_device_handler(
             &client,
             room.room_id().to_owned(),
@@ -808,7 +865,12 @@ async fn run_rtc_livekit_join() -> anyhow::Result<RtcLiveKitRuntime> {
         widget,
         #[cfg(feature = "experimental-widgets")]
         shutdown_membership_state_key,
-        sync_handle,
+        #[cfg(feature = "e2ee-per-participant")]
+        e2ee_to_device_guard,
+        #[cfg(feature = "e2ee-per-participant")]
+        to_device_probe_guard,
+        #[cfg(feature = "e2ee-per-participant")]
+        room_message_probe_guard,
         driver_handle,
     })
 }
@@ -820,7 +882,12 @@ struct RtcLiveKitRuntime {
     widget: Option<ElementCallWidget>,
     #[cfg(feature = "experimental-widgets")]
     shutdown_membership_state_key: Option<CallMemberStateKey>,
-    sync_handle: tokio::task::JoinHandle<Result<(), matrix_sdk::Error>>,
+    #[cfg(feature = "e2ee-per-participant")]
+    e2ee_to_device_guard: Option<EventHandlerDropGuard>,
+    #[cfg(feature = "e2ee-per-participant")]
+    to_device_probe_guard: EventHandlerDropGuard,
+    #[cfg(feature = "e2ee-per-participant")]
+    room_message_probe_guard: EventHandlerDropGuard,
     driver_handle: tokio::task::JoinHandle<anyhow::Result<DriverState>>,
 }
 
@@ -860,15 +927,17 @@ impl RtcLiveKitRuntime {
         Ok(())
     }
 
+    fn shutdown_call_session(&self) {
+        self.driver_handle.abort();
+    }
+
     async fn shutdown(self) {
         if let Err(err) = self.set_call_active(false).await {
             info!(?err, "failed to deactivate call while shutting down runtime");
         }
 
-        self.sync_handle.abort();
-        self.driver_handle.abort();
+        self.shutdown_call_session();
 
-        let _ = self.sync_handle.await;
         let _ = self.driver_handle.await;
     }
 }
@@ -1143,9 +1212,10 @@ async fn set_video_stream_enabled(
                     (room_handle, state.v4l2_config.as_ref().cloned())
                 {
                     info!(device = %config.device, "starting V4L2 camera publisher");
-                    let publisher = V4l2CameraPublisher::start(room_handle, config)
-                        .await
-                        .map_err(|err| LiveKitError::connector(V4l2PublishError(err)))?;
+                    let publisher =
+                        V4l2CameraPublisher::start(room_handle, state.room.clone(), config)
+                            .await
+                            .map_err(|err| LiveKitError::connector(V4l2PublishError(err)))?;
                     state.v4l2_publisher = Some(publisher);
                 }
             }

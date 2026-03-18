@@ -2347,6 +2347,7 @@ dependencies = [
  "matrix-sdk-crypto",
  "matrix-sdk-rtc",
  "matrix-sdk-rtc-livekit",
+ "mime",
  "once_cell",
  "pulldown-cmark 0.9.6",
  "rand 0.8.5",
