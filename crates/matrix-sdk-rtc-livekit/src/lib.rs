@@ -3,7 +3,6 @@
 use std::{future::Future, sync::Arc};
 
 use async_trait::async_trait;
-use futures_util::StreamExt;
 use matrix_sdk::{Client, HttpError, Room as MatrixRoom};
 use reqwest::Client as HttpClient;
 use ruma::{
@@ -108,7 +107,7 @@ where
 
     /// Run the driver until the room info stream ends.
     pub async fn run(mut self) -> LiveKitResult<()> {
-        let service_url = livekit_service_url(self.room.client()).await?;
+        let service_url = livekit_service_url(&self.room.client()).await?;
         let mut info_stream = self.room.subscribe_info();
 
         self.update_connection(&service_url, &self.room.clone_info()).await?;

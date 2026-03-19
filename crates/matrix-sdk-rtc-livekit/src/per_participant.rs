@@ -24,7 +24,6 @@ use tracing::info;
 
 use crate::LiveKitRoomOptionsProvider;
 
-
 /// Runtime context for per-participant LiveKit E2EE.
 #[derive(Clone)]
 pub struct PerParticipantE2eeContext {
@@ -67,11 +66,10 @@ pub enum PerParticipantE2eeError {
 /// Build the initial per-participant E2EE context for a Matrix room.
 pub async fn build_per_participant_e2ee(
     room: &Room,
-    force_backup_download: bool,
-    retries: usize,
-    retry_delay: Duration,
+    _force_backup_download: bool,
+    _retries: usize,
+    _retry_delay: Duration,
 ) -> Result<Option<PerParticipantE2eeContext>, PerParticipantE2eeError> {
-
     let mut key_provider_options = KeyProviderOptions::default();
     key_provider_options.ratchet_window_size = 10;
     key_provider_options.key_ring_size = 256;
