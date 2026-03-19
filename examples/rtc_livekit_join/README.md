@@ -1,10 +1,10 @@
 # LiveKit call join (skeleton)
 
-This example shows how to wire `matrix-sdk-rtc` and `matrix-sdk-rtc-livekit` to
+This example shows how to use `matrix-sdk-rtc-livekit` to
 join/leave a LiveKit room based on MatrixRTC call memberships.
 
 **Important:** this example needs MatrixRTC memberships (e.g. `m.call.member`)
-for your device before the `LiveKitRoomDriver` will connect. You can either
+for your device before the LiveKit room driver will connect. You can either
 publish memberships yourself or enable the optional Element Call widget bridge
 feature (see below), which publishes the membership via the widget API.
 
@@ -225,7 +225,7 @@ the URL does not already include one.
 1. Logs into Matrix.
 2. Joins the target room.
 3. Starts the sync loop.
-4. Runs `LiveKitRoomDriver`, which connects to LiveKit when the room has active
+4. Runs the LiveKit room driver, which connects to LiveKit when the room has active
    call memberships and disconnects when they disappear.
 
 ## Call graph (example flow)
