@@ -14,8 +14,6 @@ use ruma::{OwnedRoomId, api::client::account::request_openid_token};
 use serde_json::Value as JsonValue;
 
 #[cfg(feature = "crypto")]
-pub mod matrix_keys;
-#[cfg(feature = "crypto")]
 pub mod per_participant;
 
 pub use livekit;

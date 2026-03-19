@@ -23,10 +23,7 @@ use thiserror::Error;
 use tracing::info;
 
 use crate::LiveKitRoomOptionsProvider;
-use crate::matrix_keys::{
-    MatrixKeyMaterialError, OlmMachineKeyMaterialProvider, PerParticipantKeyMaterialProvider,
-    room_olm_machine,
-};
+
 
 /// Runtime context for per-participant LiveKit E2EE.
 #[derive(Clone)]
@@ -65,8 +62,6 @@ pub enum PerParticipantE2eeError {
     Matrix(#[from] matrix_sdk::Error),
     #[error(transparent)]
     Serde(#[from] serde_json::Error),
-    #[error(transparent)]
-    MatrixKeys(#[from] MatrixKeyMaterialError),
 }
 
 /// Build the initial per-participant E2EE context for a Matrix room.
@@ -76,39 +71,6 @@ pub async fn build_per_participant_e2ee(
     retries: usize,
     retry_delay: Duration,
 ) -> Result<Option<PerParticipantE2eeContext>, PerParticipantE2eeError> {
-    let encryption_state = room.latest_encryption_state().await?;
-    if !encryption_state.is_encrypted() {
-        return Ok(None);
-    }
-
-    if force_backup_download {
-        let _ =
-            room.client().encryption().backups().download_room_keys_for_room(room.room_id()).await;
-    }
-
-    let olm_machine = match room_olm_machine(room).await {
-        Ok(machine) => machine,
-        Err(_) => return Ok(None),
-    };
-    let provider = OlmMachineKeyMaterialProvider::new(olm_machine);
-
-    let mut attempt = 0usize;
-    loop {
-        let bundle = provider.per_participant_key_bundle(room.room_id()).await?;
-        if !bundle.is_empty() || attempt >= retries {
-            break;
-        }
-        attempt += 1;
-        if force_backup_download {
-            let _ = room
-                .client()
-                .encryption()
-                .backups()
-                .download_room_keys_for_room(room.room_id())
-                .await;
-        }
-        tokio::time::sleep(retry_delay).await;
-    }
 
     let mut key_provider_options = KeyProviderOptions::default();
     key_provider_options.ratchet_window_size = 10;
