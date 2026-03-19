@@ -4,14 +4,13 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use futures_util::StreamExt;
-use std::future::Future;
 use matrix_sdk::{Client, Room as MatrixRoom};
-use matrix_sdk_rtc::{
-    LiveKitConnection, LiveKitConnector, LiveKitError, LiveKitResult, livekit_service_url,
-};
+use matrix_sdk_rtc::{LiveKitConnection, LiveKitConnector, livekit_service_url};
+pub use matrix_sdk_rtc::{LiveKitError, LiveKitResult};
 use reqwest::Client as HttpClient;
 use ruma::{OwnedRoomId, api::client::account::request_openid_token};
 use serde_json::Value as JsonValue;
+use std::future::Future;
 
 #[cfg(feature = "crypto")]
 pub mod matrix_keys;

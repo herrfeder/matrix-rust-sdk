@@ -15,16 +15,16 @@ use url::Url;
 
 use axum;
 use axum::extract::State;
-use axum::{extract::Query, response::IntoResponse, routing::get, Router};
+use axum::{Router, extract::Query, response::IntoResponse, routing::get};
 
 use std::borrow::ToOwned;
 
 use matrix_sdk::{
+    Client, RoomState,
     config::SyncSettings,
     event_handler::EventHandlerDropGuard,
     room::Room,
     ruma::{OwnedRoomId, OwnedServerName, RoomId, RoomOrAliasId, ServerName},
-    Client, RoomState,
 };
 
 use matrix_sdk::encryption::secret_storage::SecretStore;
@@ -36,9 +36,9 @@ use tracing::Level;
 use tracing_subscriber::filter::filter_fn;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
-use tracing_subscriber::{filter, Layer};
+use tracing_subscriber::{Layer, filter};
 
-use pulldown_cmark::{html, Event, Options, Parser, Tag};
+use pulldown_cmark::{Event, Options, Parser, Tag, html};
 
 const BWI_TARGET: &str = "BWI";
 static RTC_RUNTIME: LazyLock<tokio::sync::Mutex<Option<Arc<RtcLiveKitRuntime>>>> =
@@ -518,27 +518,27 @@ async fn handle_search_result(
 
 // End Stuff from Matrix Bot
 
-use anyhow::{anyhow, Context};
+use anyhow::{Context, anyhow};
 #[cfg(feature = "experimental-widgets")]
 use matrix_sdk::widget::{
-    element_call_member_content, element_call_send_event_message, start_element_call_widget,
     ClientProperties, ElementCallWidget, ElementCallWidgetOptions, EncryptionSystem, Intent,
+    element_call_member_content, element_call_send_event_message, start_element_call_widget,
 };
 #[cfg(all(feature = "v4l2", target_os = "linux"))]
-use matrix_sdk_rtc::LiveKitError;
-use matrix_sdk_rtc::LiveKitResult;
+use matrix_sdk_rtc_livekit::LiveKitError;
+use matrix_sdk_rtc_livekit::LiveKitResult;
 #[cfg(feature = "e2ee-per-participant")]
 use matrix_sdk_rtc_livekit::livekit::id::ParticipantIdentity;
 #[cfg(feature = "e2ee-per-participant")]
 use matrix_sdk_rtc_livekit::per_participant::{
-    build_per_participant_e2ee, per_participant_key_grace_period_from_env,
-    register_e2ee_to_device_handler, send_per_participant_keys, spawn_livekit_e2ee_event_resend,
-    E2eeRoomOptionsProvider, PerParticipantE2eeContext,
+    E2eeRoomOptionsProvider, PerParticipantE2eeContext, build_per_participant_e2ee,
+    per_participant_key_grace_period_from_env, register_e2ee_to_device_handler,
+    send_per_participant_keys, spawn_livekit_e2ee_event_resend,
 };
 use matrix_sdk_rtc_livekit::{
-    handle_connection_update as handle_livekit_connection_update, resolve_connection_details,
-    run_livekit_driver_with_handler, LiveKitConnectionUpdate, LiveKitRoomOptionsProvider,
-    LiveKitSdkConnector, LiveKitTokenProvider, Room as LivekitRoom, RoomOptions,
+    LiveKitConnectionUpdate, LiveKitRoomOptionsProvider, LiveKitSdkConnector, LiveKitTokenProvider,
+    Room as LivekitRoom, RoomOptions, handle_connection_update as handle_livekit_connection_update,
+    resolve_connection_details, run_livekit_driver_with_handler,
 };
 #[cfg(feature = "experimental-widgets")]
 use ruma::events::call::member::CallMemberStateKey;
@@ -576,8 +576,8 @@ impl LiveKitRoomOptionsProvider for DefaultRoomOptionsProvider {
 mod videosource;
 #[cfg(all(feature = "v4l2", target_os = "linux"))]
 use videosource::{
-    start_background_motion_detector, stop_background_motion_detector, v4l2_config_from_env,
-    V4l2CameraPublisher, V4l2Config, V4l2PublishError,
+    V4l2CameraPublisher, V4l2Config, V4l2PublishError, start_background_motion_detector,
+    stop_background_motion_detector, v4l2_config_from_env,
 };
 
 #[cfg(not(all(feature = "v4l2", target_os = "linux")))]
