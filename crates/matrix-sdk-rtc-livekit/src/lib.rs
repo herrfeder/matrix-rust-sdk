@@ -110,10 +110,10 @@ where
         let service_url = livekit_service_url(&self.room.client()).await?;
         let mut info_stream = self.room.subscribe_info();
 
-        self.update_connection(&service_url, &self.room.clone_info()).await?;
+        self.apply_connection_update(&service_url, &self.room.clone_info()).await?;
 
         while let Some(room_info) = info_stream.next().await {
-            self.update_connection(&service_url, &room_info).await?;
+            self.apply_connection_update(&service_url, &room_info).await?;
         }
 
         if let Some(connection) = self.connection.take() {
@@ -123,22 +123,22 @@ where
         Ok(())
     }
 
-    async fn update_connection(
+    async fn apply_connection_update(
         &mut self,
         service_url: &str,
         room_info: &matrix_sdk::RoomInfo,
     ) -> LiveKitResult<()> {
-        let has_memberships = room_info.has_active_room_call();
-
-        if has_memberships {
-            if self.connection.is_none() {
+        match plan_connection_update(room_info, &mut self.connection) {
+            ConnectionUpdatePlan::Join => {
                 info!(room_id = ?self.room.room_id(), "joining LiveKit room for active call");
                 let connection = self.connector.connect(service_url, &self.room).await?;
                 self.connection = Some(connection);
             }
-        } else if let Some(connection) = self.connection.take() {
-            info!(room_id = ?self.room.room_id(), "leaving LiveKit room because the call ended");
-            connection.disconnect().await?;
+            ConnectionUpdatePlan::Leave(connection) => {
+                info!(room_id = ?self.room.room_id(), "leaving LiveKit room because the call ended");
+                connection.disconnect().await?;
+            }
+            ConnectionUpdatePlan::Unchanged => {}
         }
 
         Ok(())
@@ -388,6 +388,29 @@ where
     handler(state, update).await
 }
 
+enum ConnectionUpdatePlan<C> {
+    Join,
+    Leave(C),
+    Unchanged,
+}
+
+fn plan_connection_update<C>(
+    room_info: &matrix_sdk::RoomInfo,
+    connection: &mut Option<C>,
+) -> ConnectionUpdatePlan<C> {
+    if room_info.has_active_room_call() {
+        if connection.is_none() {
+            ConnectionUpdatePlan::Join
+        } else {
+            ConnectionUpdatePlan::Unchanged
+        }
+    } else if let Some(connection) = connection.take() {
+        ConnectionUpdatePlan::Leave(connection)
+    } else {
+        ConnectionUpdatePlan::Unchanged
+    }
+}
+
 /// Update an existing LiveKit connection based on room call memberships.
 pub async fn update_connection<T, O>(
     room: &matrix_sdk::Room,
@@ -400,26 +423,21 @@ where
     T: LiveKitTokenProvider,
     O: LiveKitRoomOptionsProvider,
 {
-    let has_memberships = room_info.has_active_room_call();
-
-    if has_memberships {
-        if connection.is_none() {
+    match plan_connection_update(room_info, connection) {
+        ConnectionUpdatePlan::Join => {
             info!(room_id = ?room.room_id(), "joining LiveKit room for active call");
             let new_connection = connector.connect(service_url, room).await?;
             let livekit_events = new_connection.take_events().await;
             let room_handle = Arc::new(new_connection.into_room());
             *connection = Some(Arc::clone(&room_handle));
-            return Ok(LiveKitConnectionUpdate::Joined {
-                room: room_handle,
-                events: livekit_events,
-            });
+            Ok(LiveKitConnectionUpdate::Joined { room: room_handle, events: livekit_events })
         }
-    } else if connection.take().is_some() {
-        info!(room_id = ?room.room_id(), "leaving LiveKit room because the call ended");
-        return Ok(LiveKitConnectionUpdate::Left);
+        ConnectionUpdatePlan::Leave(_) => {
+            info!(room_id = ?room.room_id(), "leaving LiveKit room because the call ended");
+            Ok(LiveKitConnectionUpdate::Left)
+        }
+        ConnectionUpdatePlan::Unchanged => Ok(LiveKitConnectionUpdate::Unchanged),
     }
-
-    Ok(LiveKitConnectionUpdate::Unchanged)
 }
 
 /// Run the LiveKit room driver until the room info stream ends.
