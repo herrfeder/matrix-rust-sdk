@@ -440,22 +440,6 @@ where
     }
 }
 
-/// Run the LiveKit room driver until the room info stream ends.
-pub async fn run_livekit_driver<T, O>(
-    room: matrix_sdk::Room,
-    connector: &LiveKitSdkConnector<T, O>,
-    service_url: &str,
-) -> LiveKitResult<()>
-where
-    T: LiveKitTokenProvider,
-    O: LiveKitRoomOptionsProvider,
-{
-    run_livekit_driver_with_handler(room, connector, service_url, (), |state, _update| async move {
-        Ok(state)
-    })
-    .await
-}
-
 /// Run the LiveKit room driver while delegating connection updates to a custom handler.
 pub async fn run_livekit_driver_with_handler<T, O, S, F, Fut>(
     room: matrix_sdk::Room,
