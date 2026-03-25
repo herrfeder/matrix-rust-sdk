@@ -521,3 +521,86 @@ where
         Ok(LiveKitSdkConnection { room: livekit_room, events: Mutex::new(Some(events)) })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        LiveKitConnectionDetails, LiveKitConnectionUpdate, LiveKitError, handle_connection_update,
+        select_livekit_service_url,
+    };
+    use ruma::api::client::discovery::discover_homeserver::RtcFocusInfo;
+
+    #[test]
+    fn select_livekit_service_url_prefers_first_livekit_focus() {
+        let rtc_foci = vec![
+            RtcFocusInfo::livekit("https://livekit-1.example.org".to_owned()),
+            RtcFocusInfo::livekit("https://livekit-2.example.org".to_owned()),
+        ];
+
+        let service_url = select_livekit_service_url(&rtc_foci);
+
+        assert_eq!(service_url.as_deref(), Some("https://livekit-1.example.org"));
+    }
+
+    #[test]
+    fn select_livekit_service_url_returns_none_for_empty_list() {
+        assert_eq!(select_livekit_service_url(&[]), None);
+    }
+
+    #[test]
+    fn authenticated_service_url_adds_access_token() {
+        let details = LiveKitConnectionDetails {
+            service_url: "https://livekit.example.org/room?id=123".to_owned(),
+            token: "secret-token".to_owned(),
+        };
+
+        let authenticated_url = details.authenticated_service_url().unwrap();
+
+        assert_eq!(
+            authenticated_url,
+            "https://livekit.example.org/room?id=123&access_token=secret-token"
+        );
+    }
+
+    #[test]
+    fn authenticated_service_url_preserves_existing_access_token() {
+        let details = LiveKitConnectionDetails {
+            service_url: "https://livekit.example.org/room?access_token=existing".to_owned(),
+            token: "ignored-token".to_owned(),
+        };
+
+        let authenticated_url = details.authenticated_service_url().unwrap();
+
+        assert_eq!(authenticated_url, "https://livekit.example.org/room?access_token=existing");
+    }
+
+    #[test]
+    fn authenticated_service_url_returns_error_for_invalid_url() {
+        let details = LiveKitConnectionDetails {
+            service_url: "not a valid url".to_owned(),
+            token: "token".to_owned(),
+        };
+
+        let error = details.authenticated_service_url().unwrap_err();
+
+        assert!(matches!(error, LiveKitError::Connector(_)));
+    }
+
+    #[tokio::test]
+    async fn handle_connection_update_propagates_handler_state_change() {
+        let result = handle_connection_update(
+            String::new(),
+            LiveKitConnectionUpdate::Left,
+            &|mut state, update| async move {
+                if matches!(update, LiveKitConnectionUpdate::Left) {
+                    state.push_str("left");
+                }
+                Ok(state)
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result, "left");
+    }
+}

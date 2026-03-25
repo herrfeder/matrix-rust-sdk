@@ -284,3 +284,63 @@ pub fn per_participant_key_grace_period_from_env(var: &str, default_ms: u64) -> 
         std::env::var(var).ok().and_then(|value| value.parse::<u64>().ok()).unwrap_or(default_ms);
     Duration::from_millis(grace_ms)
 }
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::{
+        E2eeRoomOptionsProvider, derive_per_participant_key,
+        per_participant_key_grace_period_from_env,
+    };
+    use crate::LiveKitRoomOptionsProvider;
+
+    #[test]
+    fn derive_per_participant_key_returns_expected_length() {
+        let key = derive_per_participant_key();
+
+        assert_eq!(key.len(), 16);
+        assert!(key.iter().any(|byte| *byte != 0));
+    }
+
+    #[test]
+    fn room_options_provider_without_context_leaves_encryption_disabled() {
+        let provider = E2eeRoomOptionsProvider { e2ee: None };
+        let options = provider.room_options();
+
+        assert!(options.encryption.is_none());
+    }
+
+    #[test]
+    fn per_participant_key_grace_period_from_env_uses_default_on_missing_or_invalid_values() {
+        let missing_var = "MATRIX_SDK_LIVEKIT_TEST_GRACE_PERIOD_MISSING";
+        let invalid_var = "MATRIX_SDK_LIVEKIT_TEST_GRACE_PERIOD_INVALID";
+
+        // SAFETY: Tests are the only callers using these dedicated variable names.
+        unsafe { std::env::remove_var(missing_var) };
+        // SAFETY: Tests are the only callers using these dedicated variable names.
+        unsafe { std::env::set_var(invalid_var, "not-a-number") };
+
+        assert_eq!(
+            per_participant_key_grace_period_from_env(missing_var, 500),
+            Duration::from_millis(500)
+        );
+        assert_eq!(
+            per_participant_key_grace_period_from_env(invalid_var, 750),
+            Duration::from_millis(750)
+        );
+    }
+
+    #[test]
+    fn per_participant_key_grace_period_from_env_uses_valid_value() {
+        let var = "MATRIX_SDK_LIVEKIT_TEST_GRACE_PERIOD_VALID";
+
+        // SAFETY: Tests are the only callers using these dedicated variable names.
+        unsafe { std::env::set_var(var, "1200") };
+
+        assert_eq!(
+            per_participant_key_grace_period_from_env(var, 300),
+            Duration::from_millis(1200)
+        );
+    }
+}
