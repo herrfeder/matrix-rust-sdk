@@ -378,3 +378,141 @@ pub fn element_call_send_event_message(
         },
     })
 }
+
+/// Publish `m.call.member` through the widget API for the current user/device.
+pub async fn publish_call_membership_via_widget(
+    room: Room,
+    widget: &ElementCallWidget,
+    service_url: &str,
+) -> Result<()> {
+    if !*widget.capabilities_ready().borrow() {
+        let mut capabilities_ready = widget.capabilities_ready();
+        let _ = capabilities_ready.changed().await;
+    }
+
+    let own_user_id = room
+        .client()
+        .user_id()
+        .ok_or_else(|| {
+            Error::UnknownError(
+                std::io::Error::other("missing user id for widget membership publisher").into(),
+            )
+        })?
+        .to_owned();
+    let own_device_id = room
+        .client()
+        .device_id()
+        .ok_or_else(|| {
+            Error::UnknownError(
+                std::io::Error::other("missing device id for widget membership publisher").into(),
+            )
+        })?
+        .to_owned();
+
+    let state_key =
+        CallMemberStateKey::new(own_user_id.clone(), Some(own_device_id.to_string()), true);
+    let content = element_call_member_content(room.room_id(), &own_device_id, service_url);
+    let request_id = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos().to_string())
+        .unwrap_or_else(|_| "0".to_owned());
+    let send_event_message = element_call_send_event_message(
+        widget.widget_id(),
+        &request_id,
+        state_key.as_ref(),
+        &content,
+    );
+
+    let send_event_message_json = send_event_message.to_string();
+    info!(
+        request_body = send_event_message_json.as_str(),
+        "Publishing MatrixRTC membership send_event via widget api"
+    );
+
+    if !widget.handle().send(send_event_message.to_string()).await {
+        return Err(Error::UnknownError(
+            std::io::Error::other(
+                "widget driver handle closed before sending membership send_event",
+            )
+            .into(),
+        ));
+    }
+
+    info!(state_key = state_key.as_ref(), "published MatrixRTC membership via widget api");
+    Ok(())
+}
+
+/// Send an empty `m.call.member` event through the widget API to shut down membership.
+pub async fn send_hangup_via_widget(
+    widget: &ElementCallWidget,
+    state_key: Option<&CallMemberStateKey>,
+) -> Result<()> {
+    const SHUTDOWN_WIDGET_WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+    if !*widget.capabilities_ready().borrow() {
+        let mut capabilities_ready = widget.capabilities_ready();
+        let _ =
+            tokio::time::timeout(SHUTDOWN_WIDGET_WAIT_TIMEOUT, capabilities_ready.changed()).await;
+    }
+
+    let request_id = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos().to_string())
+        .unwrap_or_else(|_| "0".to_owned());
+    let response_rx = widget.track_pending_response(request_id.clone());
+    let state_key = state_key.map(|state_key| state_key.as_ref()).unwrap_or_default();
+    let shutdown_message = element_call_send_event_message(
+        widget.widget_id(),
+        &request_id,
+        state_key,
+        &serde_json::json!({}),
+    );
+    info!(
+        request_body = shutdown_message.to_string().as_str(),
+        "sending shutdown membership send_event via widget api"
+    );
+
+    match tokio::time::timeout(
+        SHUTDOWN_WIDGET_WAIT_TIMEOUT,
+        widget.handle().send(shutdown_message.to_string()),
+    )
+    .await
+    {
+        Ok(true) => info!("shutdown membership send_event sent via widget api"),
+        Ok(false) => {
+            widget.remove_pending_response(&request_id);
+            return Err(Error::UnknownError(
+                std::io::Error::other(
+                    "widget driver handle closed before sending shutdown membership send_event",
+                )
+                .into(),
+            ));
+        }
+        Err(_) => {
+            widget.remove_pending_response(&request_id);
+            info!(
+                "timeout while sending shutdown membership send_event via widget api; continuing shutdown"
+            );
+            return Ok(());
+        }
+    }
+
+    match tokio::time::timeout(SHUTDOWN_WIDGET_WAIT_TIMEOUT, response_rx).await {
+        Ok(Ok(_response)) => {
+            info!(request_id, "received widget response for shutdown membership send_event")
+        }
+        Ok(Err(_)) => info!(
+            request_id,
+            "shutdown membership send_event response channel closed; continuing shutdown"
+        ),
+        Err(_) => {
+            widget.remove_pending_response(&request_id);
+            info!(
+                request_id,
+                "timeout waiting for widget shutdown membership send_event response; continuing shutdown"
+            );
+        }
+    }
+
+    Ok(())
+}

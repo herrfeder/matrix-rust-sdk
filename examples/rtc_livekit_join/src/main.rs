@@ -15,16 +15,16 @@ use url::Url;
 
 use axum;
 use axum::extract::State;
-use axum::{Router, extract::Query, response::IntoResponse, routing::get};
+use axum::{extract::Query, response::IntoResponse, routing::get, Router};
 
 use std::borrow::ToOwned;
 
 use matrix_sdk::{
-    Client, RoomState,
     config::SyncSettings,
     event_handler::EventHandlerDropGuard,
     room::Room,
     ruma::{OwnedRoomId, OwnedServerName, RoomId, RoomOrAliasId, ServerName},
+    Client, RoomState,
 };
 
 use matrix_sdk::encryption::secret_storage::SecretStore;
@@ -36,9 +36,9 @@ use tracing::Level;
 use tracing_subscriber::filter::filter_fn;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
-use tracing_subscriber::{Layer, filter};
+use tracing_subscriber::{filter, Layer};
 
-use pulldown_cmark::{Event, Options, Parser, Tag, html};
+use pulldown_cmark::{html, Event, Options, Parser, Tag};
 
 const BWI_TARGET: &str = "BWI";
 static RTC_RUNTIME: LazyLock<tokio::sync::Mutex<Option<Arc<RtcLiveKitRuntime>>>> =
@@ -518,27 +518,27 @@ async fn handle_search_result(
 
 // End Stuff from Matrix Bot
 
-use anyhow::{Context, anyhow};
+use anyhow::{anyhow, Context};
 #[cfg(feature = "experimental-widgets")]
 use matrix_sdk::widget::{
+    publish_call_membership_via_widget, send_hangup_via_widget, start_element_call_widget,
     ClientProperties, ElementCallWidget, ElementCallWidgetOptions, EncryptionSystem, Intent,
-    element_call_member_content, element_call_send_event_message, start_element_call_widget,
 };
-#[cfg(all(feature = "v4l2", target_os = "linux"))]
-use matrix_sdk_rtc_livekit::LiveKitError;
-use matrix_sdk_rtc_livekit::LiveKitResult;
 #[cfg(feature = "e2ee-per-participant")]
 use matrix_sdk_rtc_livekit::livekit::id::ParticipantIdentity;
 #[cfg(feature = "e2ee-per-participant")]
 use matrix_sdk_rtc_livekit::per_participant::{
-    E2eeRoomOptionsProvider, PerParticipantE2eeContext, build_per_participant_e2ee,
-    per_participant_key_grace_period_from_env, register_e2ee_to_device_handler,
-    send_per_participant_keys, spawn_livekit_e2ee_event_resend,
+    build_per_participant_e2ee, per_participant_key_grace_period_from_env,
+    register_e2ee_to_device_handler, send_per_participant_keys, spawn_livekit_e2ee_event_resend,
+    E2eeRoomOptionsProvider, PerParticipantE2eeContext,
 };
+#[cfg(all(feature = "v4l2", target_os = "linux"))]
+use matrix_sdk_rtc_livekit::LiveKitError;
+use matrix_sdk_rtc_livekit::LiveKitResult;
 use matrix_sdk_rtc_livekit::{
-    LiveKitConnectionUpdate, LiveKitRoomOptionsProvider, LiveKitSdkConnector, LiveKitTokenProvider,
-    Room as LivekitRoom, RoomOptions, handle_connection_update as handle_livekit_connection_update,
-    resolve_connection_details, run_livekit_driver_with_handler,
+    handle_connection_update as handle_livekit_connection_update, resolve_connection_details,
+    run_livekit_driver_with_handler, LiveKitConnectionUpdate, LiveKitRoomOptionsProvider,
+    LiveKitSdkConnector, LiveKitTokenProvider, Room as LivekitRoom, RoomOptions,
 };
 #[cfg(feature = "experimental-widgets")]
 use ruma::events::call::member::CallMemberStateKey;
@@ -547,8 +547,6 @@ use ruma::events::{AnySyncMessageLikeEvent, AnyToDeviceEvent};
 #[cfg(feature = "e2ee-per-participant")]
 use ruma::serde::Raw;
 use tracing::{info, warn};
-#[cfg(feature = "experimental-widgets")]
-use uuid::Uuid;
 
 #[cfg(all(feature = "v4l2", target_os = "linux"))]
 mod utils;
@@ -576,8 +574,8 @@ impl LiveKitRoomOptionsProvider for DefaultRoomOptionsProvider {
 mod videosource;
 #[cfg(all(feature = "v4l2", target_os = "linux"))]
 use videosource::{
-    V4l2CameraPublisher, V4l2Config, V4l2PublishError, start_background_motion_detector,
-    stop_background_motion_detector, v4l2_config_from_env,
+    start_background_motion_detector, stop_background_motion_detector, v4l2_config_from_env,
+    V4l2CameraPublisher, V4l2Config, V4l2PublishError,
 };
 
 #[cfg(not(all(feature = "v4l2", target_os = "linux")))]
@@ -990,120 +988,6 @@ fn spawn_periodic_e2ee_key_resend(room: Room, context: PerParticipantE2eeContext
 
 #[cfg(not(feature = "e2ee-per-participant"))]
 fn spawn_periodic_e2ee_key_resend(_room: Room, _context: ()) {}
-
-#[cfg(feature = "experimental-widgets")]
-async fn publish_call_membership_via_widget(
-    room: Room,
-    widget: &ElementCallWidget,
-    service_url: &str,
-) -> anyhow::Result<()> {
-    if !*widget.capabilities_ready().borrow() {
-        let mut capabilities_ready = widget.capabilities_ready();
-        let _ = capabilities_ready.changed().await;
-    }
-    let own_user_id = room
-        .client()
-        .user_id()
-        .context("missing user id for widget membership publisher")?
-        .to_owned();
-    let own_device_id = room
-        .client()
-        .device_id()
-        .context("missing device id for widget membership publisher")?
-        .to_owned();
-    let state_key =
-        CallMemberStateKey::new(own_user_id.clone(), Some(own_device_id.to_string()), true);
-    let content = element_call_member_content(room.room_id(), &own_device_id, service_url);
-    let request_id = Uuid::new_v4().to_string();
-    let send_event_message = element_call_send_event_message(
-        widget.widget_id(),
-        &request_id,
-        state_key.as_ref(),
-        &content,
-    );
-
-    let send_event_message_json = send_event_message.to_string();
-    info!(
-        request_body = send_event_message_json.as_str(),
-        "Publishing MatrixRTC membership send_event via widget api"
-    );
-
-    if !widget.handle().send(send_event_message.to_string()).await {
-        return Err(anyhow!("widget driver handle closed before sending membership send_event"));
-    }
-
-    info!(state_key = state_key.as_ref(), "published MatrixRTC membership via widget api");
-    Ok(())
-}
-
-#[cfg(feature = "experimental-widgets")]
-async fn send_hangup_via_widget(
-    widget: &ElementCallWidget,
-    state_key: Option<&CallMemberStateKey>,
-) -> anyhow::Result<()> {
-    const SHUTDOWN_WIDGET_WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
-
-    if !*widget.capabilities_ready().borrow() {
-        let mut capabilities_ready = widget.capabilities_ready();
-        let _ =
-            tokio::time::timeout(SHUTDOWN_WIDGET_WAIT_TIMEOUT, capabilities_ready.changed()).await;
-    }
-
-    let request_id = Uuid::new_v4().to_string();
-    let response_rx = widget.track_pending_response(request_id.clone());
-    let state_key = state_key.map(|state_key| state_key.as_ref()).unwrap_or_default();
-    let shutdown_message = element_call_send_event_message(
-        widget.widget_id(),
-        &request_id,
-        state_key,
-        &serde_json::json!({}),
-    );
-    info!(
-        request_body = shutdown_message.to_string().as_str(),
-        "sending shutdown membership send_event via widget api"
-    );
-
-    match tokio::time::timeout(
-        SHUTDOWN_WIDGET_WAIT_TIMEOUT,
-        widget.handle().send(shutdown_message.to_string()),
-    )
-    .await
-    {
-        Ok(true) => info!("shutdown membership send_event sent via widget api"),
-        Ok(false) => {
-            widget.remove_pending_response(&request_id);
-            return Err(anyhow!(
-                "widget driver handle closed before sending shutdown membership send_event"
-            ));
-        }
-        Err(_) => {
-            widget.remove_pending_response(&request_id);
-            info!(
-                "timeout while sending shutdown membership send_event via widget api; continuing shutdown"
-            );
-            return Ok(());
-        }
-    }
-
-    match tokio::time::timeout(SHUTDOWN_WIDGET_WAIT_TIMEOUT, response_rx).await {
-        Ok(Ok(_response)) => {
-            info!(request_id, "received widget response for shutdown membership send_event")
-        }
-        Ok(Err(_)) => info!(
-            request_id,
-            "shutdown membership send_event response channel closed; continuing shutdown"
-        ),
-        Err(_) => {
-            widget.remove_pending_response(&request_id);
-            info!(
-                request_id,
-                "timeout waiting for widget shutdown membership send_event response; continuing shutdown"
-            );
-        }
-    }
-
-    Ok(())
-}
 
 fn via_servers_from_env() -> anyhow::Result<Vec<OwnedServerName>> {
     let value = match env::var("VIA_SERVERS") {
