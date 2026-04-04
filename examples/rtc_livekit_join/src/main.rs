@@ -88,8 +88,7 @@ impl LiveKitRoomOptionsProvider for DefaultRoomOptionsProvider {
 mod videosource;
 #[cfg(all(feature = "v4l2", target_os = "linux"))]
 use videosource::{
-    V4l2CameraPublisher, V4l2Config, V4l2PublishError, start_background_motion_detector,
-    stop_background_motion_detector, v4l2_config_from_env,
+    V4l2CameraPublisher, V4l2Config, V4l2PublishError, v4l2_config_from_env,
 };
 
 #[cfg(not(all(feature = "v4l2", target_os = "linux")))]
