@@ -34,6 +34,7 @@ use anyhow::{Context, anyhow};
 use matrix_sdk::widget::{
     ClientProperties, ElementCallWidget, ElementCallWidgetOptions, EncryptionSystem, Intent,
     element_call_member_content, element_call_send_event_message, start_element_call_widget,
+    publish_call_membership_via_widget, send_hangup_via_widget,
 };
 #[cfg(all(feature = "v4l2", target_os = "linux"))]
 use matrix_sdk_rtc_livekit::LiveKitError;
