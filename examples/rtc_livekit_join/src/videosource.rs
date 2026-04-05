@@ -15,7 +15,6 @@ use tracing::{debug, info, warn};
 #[cfg(all(feature = "v4l2", target_os = "linux"))]
 use crate::{
     optional_env,
-    utils::{spawn_stdin_text_task, TextOverlayState},
 };
 
 #[cfg(all(feature = "v4l2", target_os = "linux"))]
@@ -55,7 +54,6 @@ pub(crate) struct V4l2CameraPublisher {
     track: matrix_sdk_rtc_livekit::livekit::track::LocalVideoTrack,
     stop_tx: Option<std::sync::mpsc::Sender<()>>,
     task: Option<tokio::task::JoinHandle<anyhow::Result<()>>>,
-    stdin_overlay_task: Option<tokio::task::JoinHandle<()>>,
 }
 
 #[cfg(all(feature = "v4l2", target_os = "linux"))]
@@ -78,8 +76,6 @@ impl V4l2CameraPublisher {
 
         let (resolution, rtc_source, capture_mode) =
             configure_v4l2_capture_mode(&config).context("configure V4L2 capture")?;
-        let text_overlay = Arc::new(Mutex::new(TextOverlayState::default()));
-        let stdin_overlay_task = spawn_stdin_text_task(text_overlay.clone());
 
         let track = matrix_sdk_rtc_livekit::livekit::track::LocalVideoTrack::create_video_track(
             "v4l2_camera",
@@ -110,7 +106,6 @@ impl V4l2CameraPublisher {
                 pixel_format,
                 rtc_source,
                 stop_rx,
-                text_overlay,
             ),
             V4l2CaptureMode::TestRedFrames => {
                 run_generated_red_capture_loop(resolution, rtc_source, stop_rx)
@@ -122,7 +117,6 @@ impl V4l2CameraPublisher {
             track,
             stop_tx: Some(stop_tx),
             task: Some(task),
-            stdin_overlay_task: Some(stdin_overlay_task),
         })
     }
 
@@ -130,9 +124,6 @@ impl V4l2CameraPublisher {
         info!(room_name = %self.room.name(), "stopping V4L2 camera track");
         if let Some(stop_tx) = self.stop_tx.take() {
             let _ = stop_tx.send(());
-        }
-        if let Some(stdin_overlay_task) = self.stdin_overlay_task.take() {
-            stdin_overlay_task.abort();
         }
         if let Some(task) = self.task.take() {
             let _ = task.await?;
@@ -152,9 +143,7 @@ impl Drop for V4l2CameraPublisher {
         if let Some(stop_tx) = self.stop_tx.take() {
             let _ = stop_tx.send(());
         }
-        if let Some(stdin_overlay_task) = self.stdin_overlay_task.take() {
-            stdin_overlay_task.abort();
-        }
+
         if let Some(task) = self.task.take() {
             task.abort();
         }
@@ -235,7 +224,6 @@ fn run_v4l2_capture_loop(
     pixel_format: V4l2PixelFormat,
     rtc_source: matrix_sdk_rtc_livekit::livekit::webrtc::video_source::native::NativeVideoSource,
     stop_rx: std::sync::mpsc::Receiver<()>,
-    text_overlay: Arc<Mutex<TextOverlayState>>,
 ) -> anyhow::Result<()> {
     use matrix_sdk_rtc_livekit::livekit::webrtc::native::yuv_helper;
     use matrix_sdk_rtc_livekit::livekit::webrtc::prelude::{I420Buffer, VideoFrame, VideoRotation};
@@ -313,10 +301,6 @@ fn run_v4l2_capture_loop(
                     data, width, stride, height, dst_y, stride_y, dst_u, stride_u, dst_v, stride_v,
                 );
             }
-        }
-
-        if let Ok(mut overlay) = text_overlay.lock() {
-            overlay.tick_and_draw(&resolution, dst_y, stride_y, dst_u, stride_u, dst_v, stride_v);
         }
 
         frame.timestamp_us = start.elapsed().as_micros() as i64;
