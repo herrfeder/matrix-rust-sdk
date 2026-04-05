@@ -62,9 +62,6 @@ use tracing::{info, warn};
 #[cfg(feature = "experimental-widgets")]
 use uuid::Uuid;
 
-#[cfg(all(feature = "v4l2", target_os = "linux"))]
-mod utils;
-
 struct EnvLiveKitTokenProvider {
     token: String,
 }
