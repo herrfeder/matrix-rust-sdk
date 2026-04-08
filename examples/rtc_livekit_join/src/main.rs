@@ -1,12 +1,8 @@
 #![recursion_limit = "256"]
 
-use serde::Deserialize;
-use std::sync::{Arc, LazyLock};
+use std::sync::Arc;
 use std::{env, fs};
 
-
-use reqwest;
-use url::Url;
 use std::time::Duration;
 use std::borrow::ToOwned;
 use std::thread;
@@ -19,22 +15,12 @@ use matrix_sdk::{
 };
 
 use matrix_sdk::encryption::secret_storage::SecretStore;
-use matrix_sdk::ruma::events::room::message::{
-    MessageType, OriginalSyncRoomMessageEvent, RoomMessageEventContent,
-};
-
-use tracing::Level;
-use tracing_subscriber::filter::filter_fn;
-use tracing_subscriber::layer::SubscriberExt;
-use tracing_subscriber::util::SubscriberInitExt;
-use tracing_subscriber::{filter, Layer};
 
 use anyhow::{Context, anyhow};
 #[cfg(feature = "experimental-widgets")]
 use matrix_sdk::widget::{
     ClientProperties, ElementCallWidget, ElementCallWidgetOptions, EncryptionSystem, Intent,
-    element_call_member_content, element_call_send_event_message, start_element_call_widget,
-    publish_call_membership_via_widget, send_hangup_via_widget,
+    start_element_call_widget, publish_call_membership_via_widget, send_hangup_via_widget,
 };
 #[cfg(all(feature = "v4l2", target_os = "linux"))]
 use matrix_sdk_rtc_livekit::LiveKitError;
@@ -61,6 +47,13 @@ use ruma::serde::Raw;
 use tracing::{info, warn};
 #[cfg(feature = "experimental-widgets")]
 use uuid::Uuid;
+#[cfg(all(feature = "v4l2", target_os = "linux"))]
+mod videosource;
+#[cfg(all(feature = "v4l2", target_os = "linux"))]
+use videosource::{
+    V4l2CameraPublisher, V4l2Config, V4l2PublishError, v4l2_config_from_env,
+};
+
 
 struct EnvLiveKitTokenProvider {
     token: String,
@@ -80,13 +73,6 @@ impl LiveKitRoomOptionsProvider for DefaultRoomOptionsProvider {
         RoomOptions::default()
     }
 }
-
-#[cfg(all(feature = "v4l2", target_os = "linux"))]
-mod videosource;
-#[cfg(all(feature = "v4l2", target_os = "linux"))]
-use videosource::{
-    V4l2CameraPublisher, V4l2Config, V4l2PublishError, v4l2_config_from_env,
-};
 
 #[cfg(not(all(feature = "v4l2", target_os = "linux")))]
 fn v4l2_config_from_env() -> anyhow::Result<()> {
@@ -711,7 +697,7 @@ async fn set_video_stream_enabled(
                 {
                     info!(device = %config.device, "starting V4L2 camera publisher");
                     let publisher =
-                        V4l2CameraPublisher::start(room_handle, state.room.clone(), config)
+                        V4l2CameraPublisher::start(room_handle, config)
                             .await
                             .map_err(|err| LiveKitError::connector(V4l2PublishError(err)))?;
                     state.v4l2_publisher = Some(publisher);
