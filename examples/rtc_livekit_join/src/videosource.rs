@@ -1,18 +1,7 @@
-#[cfg(all(feature = "v4l2", target_os = "linux"))]
-use std::sync::{Arc, LazyLock, Mutex};
-
-#[cfg(all(feature = "v4l2", target_os = "linux"))]
+use std::sync::Arc;
 use anyhow::{anyhow, Context};
-#[cfg(all(feature = "v4l2", target_os = "linux"))]
-use matrix_sdk::{
-    attachment::AttachmentConfig, ruma::events::room::message::TextMessageEventContent,
-    Room as MatrixRoom,
-};
 use matrix_sdk_rtc_livekit::Room as LivekitRoom;
-#[cfg(all(feature = "v4l2", target_os = "linux"))]
-use tracing::{debug, info, warn};
-
-#[cfg(all(feature = "v4l2", target_os = "linux"))]
+use tracing::{info, warn};
 use crate::{
     optional_env,
 };
@@ -67,7 +56,6 @@ enum V4l2PixelFormat {
 impl V4l2CameraPublisher {
     pub(crate) async fn start(
         room: Arc<LivekitRoom>,
-        matrix_room: MatrixRoom,
         config: V4l2Config,
     ) -> anyhow::Result<Self> {
         use matrix_sdk_rtc_livekit::livekit::options::{TrackPublishOptions, VideoCodec};
