@@ -3,16 +3,15 @@
 use std::sync::Arc;
 use std::{env, fs};
 
-use std::time::Duration;
-use std::borrow::ToOwned;
-use std::thread;
 use matrix_sdk::{
+    Client, RoomState,
     config::SyncSettings,
     event_handler::EventHandlerDropGuard,
     room::Room,
     ruma::{OwnedRoomId, OwnedServerName, RoomId, RoomOrAliasId, ServerName},
-    Client, RoomState,
 };
+use std::borrow::ToOwned;
+use std::time::Duration;
 
 use matrix_sdk::encryption::secret_storage::SecretStore;
 
@@ -20,7 +19,7 @@ use anyhow::{Context, anyhow};
 #[cfg(feature = "experimental-widgets")]
 use matrix_sdk::widget::{
     ClientProperties, ElementCallWidget, ElementCallWidgetOptions, EncryptionSystem, Intent,
-    start_element_call_widget, publish_call_membership_via_widget, send_hangup_via_widget,
+    publish_call_membership_via_widget, send_hangup_via_widget, start_element_call_widget,
 };
 #[cfg(all(feature = "v4l2", target_os = "linux"))]
 use matrix_sdk_rtc_livekit::LiveKitError;
@@ -50,10 +49,7 @@ use uuid::Uuid;
 #[cfg(all(feature = "v4l2", target_os = "linux"))]
 mod videosource;
 #[cfg(all(feature = "v4l2", target_os = "linux"))]
-use videosource::{
-    V4l2CameraPublisher, V4l2Config, V4l2PublishError, v4l2_config_from_env,
-};
-
+use videosource::{V4l2CameraPublisher, V4l2Config, V4l2PublishError, v4l2_config_from_env};
 
 struct EnvLiveKitTokenProvider {
     token: String,
@@ -78,7 +74,6 @@ impl LiveKitRoomOptionsProvider for DefaultRoomOptionsProvider {
 fn v4l2_config_from_env() -> anyhow::Result<()> {
     Ok(())
 }
-
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -112,18 +107,22 @@ async fn main() -> anyhow::Result<()> {
 
     println!("before webserver setup");
 
+    let sync_handle = tokio::spawn({
+        let client = client.clone();
+        async move { sync(client).await }
+    });
 
     let rtc = run_rtc_livekit_join(client.clone()).await?;
     rtc.set_call_active(true).await?;
 
     //tokio::signal::ctrl_c().await.context("wait for ctrl+c")?;
-   // info!("received ctrl+c; shutting down rtc client");
+    // info!("received ctrl+c; shutting down rtc client");
 
-    thread::sleep(Duration::from_secs(10));
+    tokio::time::sleep(Duration::from_secs(10)).await;
     rtc.set_call_active(false).await?;
     rtc.shutdown().await;
 
-    thread::sleep(Duration::from_secs(10));
+    tokio::time::sleep(Duration::from_secs(10)).await;
 
     let rtc = run_rtc_livekit_join(client.clone()).await?;
     rtc.set_call_active(true).await?;
@@ -131,11 +130,11 @@ async fn main() -> anyhow::Result<()> {
     //tokio::signal::ctrl_c().await.context("wait for ctrl+c")?;
     //info!("received ctrl+c; shutting down rtc client");
 
-    thread::sleep(Duration::from_secs(10));
+    tokio::time::sleep(Duration::from_secs(10)).await;
     rtc.set_call_active(false).await?;
     rtc.shutdown().await;
 
-    sync(client.clone()).await?;
+    sync_handle.abort();
     Ok(())
 }
 
@@ -696,10 +695,9 @@ async fn set_video_stream_enabled(
                     (room_handle, state.v4l2_config.as_ref().cloned())
                 {
                     info!(device = %config.device, "starting V4L2 camera publisher");
-                    let publisher =
-                        V4l2CameraPublisher::start(room_handle, config)
-                            .await
-                            .map_err(|err| LiveKitError::connector(V4l2PublishError(err)))?;
+                    let publisher = V4l2CameraPublisher::start(room_handle, config)
+                        .await
+                        .map_err(|err| LiveKitError::connector(V4l2PublishError(err)))?;
                     state.v4l2_publisher = Some(publisher);
                 }
             }
