@@ -184,7 +184,7 @@ pub fn register_e2ee_to_device_handler(
                 .unwrap_or_else(|| "<missing>".to_owned());
 
             if !seen_first_callback.swap(true, std::sync::atomic::Ordering::Relaxed) {
-                info!(
+                debug!(
                     expected_room_id = %room_id,
                     "per-participant E2EE to-device handler callback triggered"
                 );
@@ -249,7 +249,7 @@ pub fn register_e2ee_to_device_handler(
                 return;
             };
 
-            info!(
+            debug!(
                 sender = %event.sender,
                 sender_device = %sender_device_id,
                 event_room_id = %event.content.room_id,
