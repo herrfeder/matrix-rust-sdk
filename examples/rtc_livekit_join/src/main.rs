@@ -39,10 +39,6 @@ use matrix_sdk_rtc_livekit::{
 };
 #[cfg(feature = "experimental-widgets")]
 use ruma::events::call::member::CallMemberStateKey;
-#[cfg(feature = "e2ee-per-participant")]
-use ruma::events::{AnySyncMessageLikeEvent, AnyToDeviceEvent};
-#[cfg(feature = "e2ee-per-participant")]
-use ruma::serde::Raw;
 use tracing::{info, warn};
 #[cfg(feature = "experimental-widgets")]
 use uuid::Uuid;
@@ -339,12 +335,6 @@ async fn run_rtc_livekit_join(client: Client) -> anyhow::Result<RtcLiveKitRuntim
     #[cfg(not(feature = "experimental-widgets"))]
     let widget: Option<()> = None;
 
-    #[cfg(feature = "e2ee-per-participant")]
-    let to_device_probe_guard = register_any_to_device_probe_handler(&client);
-    #[cfg(feature = "e2ee-per-participant")]
-    let room_message_probe_guard =
-        register_room_message_key_probe_handler(&client, room.room_id().to_owned());
-
     let static_livekit_token = optional_env("LIVEKIT_TOKEN");
     let connection_details = resolve_connection_details(
         &client,
@@ -464,10 +454,6 @@ async fn run_rtc_livekit_join(client: Client) -> anyhow::Result<RtcLiveKitRuntim
         shutdown_membership_state_key,
         #[cfg(feature = "e2ee-per-participant")]
         e2ee_to_device_guard,
-        #[cfg(feature = "e2ee-per-participant")]
-        to_device_probe_guard,
-        #[cfg(feature = "e2ee-per-participant")]
-        room_message_probe_guard,
         driver_handle,
     })
 }
@@ -481,10 +467,6 @@ struct RtcLiveKitRuntime {
     shutdown_membership_state_key: Option<CallMemberStateKey>,
     #[cfg(feature = "e2ee-per-participant")]
     e2ee_to_device_guard: Option<EventHandlerDropGuard>,
-    #[cfg(feature = "e2ee-per-participant")]
-    to_device_probe_guard: EventHandlerDropGuard,
-    #[cfg(feature = "e2ee-per-participant")]
-    room_message_probe_guard: EventHandlerDropGuard,
     driver_handle: tokio::task::JoinHandle<anyhow::Result<DriverState>>,
 }
 
@@ -601,56 +583,6 @@ fn via_servers_from_env() -> anyhow::Result<Vec<OwnedServerName>> {
         .filter(|entry| !entry.is_empty())
         .map(|entry| ServerName::parse(entry).context("parse server name"))
         .collect()
-}
-
-#[cfg(feature = "e2ee-per-participant")]
-fn register_any_to_device_probe_handler(client: &Client) -> EventHandlerDropGuard {
-    info!("registering probe handler for all to-device events");
-
-    let handle = client.add_event_handler(move |raw: Raw<AnyToDeviceEvent>| async move {
-        let event_type = raw
-            .get_field::<String>("type")
-            .ok()
-            .flatten()
-            .unwrap_or_else(|| "<missing>".to_owned());
-        let sender = raw
-            .get_field::<String>("sender")
-            .ok()
-            .flatten()
-            .unwrap_or_else(|| "<missing>".to_owned());
-        info!(event_type, sender, "probe observed to-device event");
-    });
-
-    client.event_handler_drop_guard(handle)
-}
-
-#[cfg(feature = "e2ee-per-participant")]
-fn register_room_message_key_probe_handler(
-    client: &Client,
-    room_id: OwnedRoomId,
-) -> EventHandlerDropGuard {
-    info!(%room_id, "registering room message-like probe for encryption keys");
-
-    let room_id_for_handler = room_id.clone();
-    let handle = client.add_room_event_handler(
-        &room_id_for_handler,
-        move |raw: Raw<AnySyncMessageLikeEvent>| {
-            let room_id = room_id.clone();
-            async move {
-                let event_type = raw
-                    .get_field::<String>("type")
-                    .ok()
-                    .flatten()
-                    .unwrap_or_else(|| "<missing>".to_owned());
-
-                if event_type == "io.element.call.encryption_keys" {
-                    info!(%room_id, "probe observed room message-like encryption key event");
-                }
-            }
-        },
-    );
-
-    client.event_handler_drop_guard(handle)
 }
 
 struct DriverState {
