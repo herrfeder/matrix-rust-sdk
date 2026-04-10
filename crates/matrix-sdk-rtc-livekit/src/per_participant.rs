@@ -175,7 +175,16 @@ pub fn register_e2ee_to_device_handler(
         let key_provider = Arc::clone(&key_provider);
         let room_id = room_id.clone();
         async move {
-            let Ok(event) = raw.deserialize_as::<IncomingKeyToDeviceEvent>() else {
+            let Ok(event_map) =
+                raw.deserialize_as::<serde_json::Map<std::string::String, serde_json::Value>>()
+            else {
+                return;
+            };
+            let Ok(event) =
+                serde_json::from_value::<IncomingKeyToDeviceEvent>(serde_json::Value::Object(
+                    event_map,
+                ))
+            else {
                 return;
             };
 
