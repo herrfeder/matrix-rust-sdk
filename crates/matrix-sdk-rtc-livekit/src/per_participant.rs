@@ -19,8 +19,9 @@ use matrix_sdk_base::crypto::CollectStrategy;
 use rand::{RngCore, rngs::OsRng};
 use ruma::serde::Raw;
 use ruma::{OwnedRoomId, events::AnyToDeviceEvent};
+use serde::Deserialize;
 use thiserror::Error;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::LiveKitRoomOptionsProvider;
 
@@ -170,72 +171,87 @@ pub fn register_e2ee_to_device_handler(
     room_id: OwnedRoomId,
     key_provider: Arc<KeyProvider>,
 ) -> EventHandlerDropGuard {
-    let seen_first_event = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let handle = client.add_event_handler(move |raw: Raw<AnyToDeviceEvent>| {
         let key_provider = Arc::clone(&key_provider);
         let room_id = room_id.clone();
-        let seen_first_event = seen_first_event.clone();
         async move {
-            if !seen_first_event.swap(true, std::sync::atomic::Ordering::Relaxed) {
-                info!("per-participant E2EE to-device handler observed first to-device event");
-            }
+            let Ok(event) = raw.deserialize_as::<IncomingKeyToDeviceEvent>() else {
+                return;
+            };
 
-            let Ok(value) = raw.deserialize_as::<serde_json::Value>() else {
-                return;
-            };
-            let Some(event_type) = value.get("type").and_then(|v| v.as_str()) else {
-                return;
-            };
-            if event_type != "io.element.call.encryption_keys" {
+            if event.event_type != "io.element.call.encryption_keys"
+                || event.content.room_id != room_id.as_str()
+            {
                 return;
             }
 
-            let Some(sender) = value.get("sender").and_then(|v| v.as_str()) else {
-                return;
-            };
-            let Some(content) = value.get("content").and_then(|v| v.as_object()) else {
-                return;
-            };
-            let Some(content_room_id) = content.get("room_id").and_then(|v| v.as_str()) else {
-                return;
-            };
-            if content_room_id != room_id.as_str() {
-                return;
-            }
-            let Some(device_id) = content.get("device_id").and_then(|v| v.as_str()) else {
-                return;
-            };
-            let keys = content.get("keys");
-            let key_entries: Vec<&serde_json::Value> = match keys {
-                Some(value) if value.is_array() => {
-                    value.as_array().map(|values| values.iter().collect()).unwrap_or_default()
-                }
-                Some(value) if value.is_object() => vec![value],
-                _ => return,
-            };
-
-            let identity = ParticipantIdentity(format!("{sender}:{device_id}"));
-            for key_entry in key_entries {
-                let Some(index) = key_entry.get("index").and_then(|v| v.as_i64()) else {
-                    continue;
-                };
-                let Some(key_b64) = key_entry.get("key").and_then(|v| v.as_str()) else {
-                    continue;
-                };
+            let identity =
+                ParticipantIdentity(format!("{}:{}", event.sender, event.content.device_id));
+            for key_entry in event.content.keys {
                 let key_bytes = STANDARD_NO_PAD
-                    .decode(key_b64)
-                    .or_else(|_| STANDARD.decode(key_b64))
-                    .or_else(|_| URL_SAFE_NO_PAD.decode(key_b64))
-                    .or_else(|_| URL_SAFE.decode(key_b64));
+                    .decode(&key_entry.key)
+                    .or_else(|_| STANDARD.decode(&key_entry.key))
+                    .or_else(|_| URL_SAFE_NO_PAD.decode(&key_entry.key))
+                    .or_else(|_| URL_SAFE.decode(&key_entry.key));
                 let Ok(key_bytes) = key_bytes else {
+                    warn!(
+                        %identity,
+                        key_index = key_entry.index,
+                        "failed to decode per-participant E2EE key"
+                    );
                     continue;
                 };
-                key_provider.set_key(&identity, index as i32, key_bytes);
+                let key_set = key_provider.set_key(&identity, key_entry.index, key_bytes);
+                info!(
+                    %identity,
+                    key_index = key_entry.index,
+                    key_set,
+                    "installed per-participant E2EE key from to-device event"
+                );
             }
         }
     });
 
     client.event_handler_drop_guard(handle)
+}
+
+#[derive(Deserialize)]
+struct IncomingKeyToDeviceEvent {
+    #[serde(rename = "type")]
+    event_type: String,
+    sender: String,
+    content: IncomingKeyToDeviceContent,
+}
+
+#[derive(Deserialize)]
+struct IncomingKeyToDeviceContent {
+    room_id: String,
+    device_id: String,
+    #[serde(deserialize_with = "deserialize_key_entries")]
+    keys: Vec<IncomingKeyEntry>,
+}
+
+#[derive(Deserialize)]
+struct IncomingKeyEntry {
+    index: i32,
+    key: String,
+}
+
+fn deserialize_key_entries<'de, D>(deserializer: D) -> Result<Vec<IncomingKeyEntry>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Keys {
+        One(IncomingKeyEntry),
+        Many(Vec<IncomingKeyEntry>),
+    }
+
+    match Keys::deserialize(deserializer)? {
+        Keys::One(entry) => Ok(vec![entry]),
+        Keys::Many(entries) => Ok(entries),
+    }
 }
 
 /// Resend keys on selected LiveKit room events.
