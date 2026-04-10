@@ -1400,7 +1400,12 @@ impl OlmMachine {
                 self.receive_room_key_bundle_data(decrypted.result.sender_key, e, changes).await?;
             }
             AnyDecryptedOlmEvent::Custom(_) => {
-                warn!("Received an unexpected encrypted to-device event");
+                if decrypted.result.event.event_type().to_string() == "io.element.call.encryption_keys"
+                {
+                    debug!("Received custom encrypted to-device key event");
+                } else {
+                    warn!("Received an unexpected encrypted to-device event");
+                }
             }
         }
 

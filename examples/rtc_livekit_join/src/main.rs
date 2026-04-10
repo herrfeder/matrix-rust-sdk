@@ -3,16 +3,15 @@
 use std::sync::Arc;
 use std::{env, fs};
 
-use std::time::Duration;
-use std::borrow::ToOwned;
-use std::thread;
 use matrix_sdk::{
+    Client, RoomState,
     config::SyncSettings,
     event_handler::EventHandlerDropGuard,
     room::Room,
     ruma::{OwnedRoomId, OwnedServerName, RoomId, RoomOrAliasId, ServerName},
-    Client, RoomState,
 };
+use std::borrow::ToOwned;
+use std::time::Duration;
 
 use matrix_sdk::encryption::secret_storage::SecretStore;
 
@@ -20,13 +19,15 @@ use anyhow::{Context, anyhow};
 #[cfg(feature = "experimental-widgets")]
 use matrix_sdk::widget::{
     ClientProperties, ElementCallWidget, ElementCallWidgetOptions, EncryptionSystem, Intent,
-    start_element_call_widget, publish_call_membership_via_widget, send_hangup_via_widget,
+    publish_call_membership_via_widget, send_hangup_via_widget, start_element_call_widget,
 };
 #[cfg(all(feature = "v4l2", target_os = "linux"))]
 use matrix_sdk_rtc_livekit::LiveKitError;
 use matrix_sdk_rtc_livekit::LiveKitResult;
 #[cfg(feature = "e2ee-per-participant")]
 use matrix_sdk_rtc_livekit::livekit::id::ParticipantIdentity;
+#[cfg(feature = "e2ee-per-participant")]
+use matrix_sdk_rtc_livekit::livekit::e2ee::key_provider::{KeyDerivationFunction, KeyProvider, KeyProviderOptions};
 #[cfg(feature = "e2ee-per-participant")]
 use matrix_sdk_rtc_livekit::per_participant::{
     E2eeRoomOptionsProvider, PerParticipantE2eeContext, build_per_participant_e2ee,
@@ -40,20 +41,13 @@ use matrix_sdk_rtc_livekit::{
 };
 #[cfg(feature = "experimental-widgets")]
 use ruma::events::call::member::CallMemberStateKey;
-#[cfg(feature = "e2ee-per-participant")]
-use ruma::events::{AnySyncMessageLikeEvent, AnyToDeviceEvent};
-#[cfg(feature = "e2ee-per-participant")]
-use ruma::serde::Raw;
 use tracing::{info, warn};
 #[cfg(feature = "experimental-widgets")]
 use uuid::Uuid;
 #[cfg(all(feature = "v4l2", target_os = "linux"))]
 mod videosource;
 #[cfg(all(feature = "v4l2", target_os = "linux"))]
-use videosource::{
-    V4l2CameraPublisher, V4l2Config, V4l2PublishError, v4l2_config_from_env,
-};
-
+use videosource::{V4l2CameraPublisher, V4l2Config, V4l2PublishError, v4l2_config_from_env};
 
 struct EnvLiveKitTokenProvider {
     token: String,
@@ -78,7 +72,6 @@ impl LiveKitRoomOptionsProvider for DefaultRoomOptionsProvider {
 fn v4l2_config_from_env() -> anyhow::Result<()> {
     Ok(())
 }
-
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -112,18 +105,22 @@ async fn main() -> anyhow::Result<()> {
 
     println!("before webserver setup");
 
+    let sync_handle = tokio::spawn({
+        let client = client.clone();
+        async move { sync(client).await }
+    });
 
     let rtc = run_rtc_livekit_join(client.clone()).await?;
     rtc.set_call_active(true).await?;
 
     //tokio::signal::ctrl_c().await.context("wait for ctrl+c")?;
-   // info!("received ctrl+c; shutting down rtc client");
+    // info!("received ctrl+c; shutting down rtc client");
 
-    thread::sleep(Duration::from_secs(10));
+    tokio::time::sleep(Duration::from_secs(10)).await;
     rtc.set_call_active(false).await?;
     rtc.shutdown().await;
 
-    thread::sleep(Duration::from_secs(10));
+    tokio::time::sleep(Duration::from_secs(10)).await;
 
     let rtc = run_rtc_livekit_join(client.clone()).await?;
     rtc.set_call_active(true).await?;
@@ -131,11 +128,11 @@ async fn main() -> anyhow::Result<()> {
     //tokio::signal::ctrl_c().await.context("wait for ctrl+c")?;
     //info!("received ctrl+c; shutting down rtc client");
 
-    thread::sleep(Duration::from_secs(10));
+    tokio::time::sleep(Duration::from_secs(10)).await;
     rtc.set_call_active(false).await?;
     rtc.shutdown().await;
 
-    sync(client.clone()).await?;
+    sync_handle.abort();
     Ok(())
 }
 
@@ -340,12 +337,6 @@ async fn run_rtc_livekit_join(client: Client) -> anyhow::Result<RtcLiveKitRuntim
     #[cfg(not(feature = "experimental-widgets"))]
     let widget: Option<()> = None;
 
-    #[cfg(feature = "e2ee-per-participant")]
-    let to_device_probe_guard = register_any_to_device_probe_handler(&client);
-    #[cfg(feature = "e2ee-per-participant")]
-    let room_message_probe_guard =
-        register_room_message_key_probe_handler(&client, room.room_id().to_owned());
-
     let static_livekit_token = optional_env("LIVEKIT_TOKEN");
     let connection_details = resolve_connection_details(
         &client,
@@ -388,13 +379,28 @@ async fn run_rtc_livekit_join(client: Client) -> anyhow::Result<RtcLiveKitRuntim
         }
     }
     #[cfg(feature = "e2ee-per-participant")]
-    let e2ee_to_device_guard = e2ee_context.as_ref().map(|context| {
-        register_e2ee_to_device_handler(
-            &client,
-            room.room_id().to_owned(),
-            Arc::clone(&context.key_provider),
-        )
-    });
+    let e2ee_to_device_key_provider = if let Some(context) = e2ee_context.as_ref() {
+        Arc::clone(&context.key_provider)
+    } else {
+        warn!(
+            room_id = %room.room_id(),
+            "per-participant E2EE context unavailable; registering to-device handler with fallback key provider"
+        );
+        let mut fallback_options = KeyProviderOptions::default();
+        fallback_options.ratchet_window_size = 10;
+        fallback_options.key_ring_size = 256;
+        fallback_options.key_derivation_function = KeyDerivationFunction::HKDF;
+        Arc::new(KeyProvider::new(fallback_options))
+    };
+    info!(
+        room_id = %room.room_id(),
+        "registering per-participant E2EE to-device key handler (kept alive via EventHandlerDropGuard)"
+    );
+    let e2ee_to_device_guard = register_e2ee_to_device_handler(
+        &client,
+        room.room_id().to_owned(),
+        e2ee_to_device_key_provider,
+    );
     #[cfg(feature = "e2ee-per-participant")]
     if let Some(context) = e2ee_context.as_ref() {
         spawn_periodic_e2ee_key_resend(room.clone(), context.clone());
@@ -465,10 +471,6 @@ async fn run_rtc_livekit_join(client: Client) -> anyhow::Result<RtcLiveKitRuntim
         shutdown_membership_state_key,
         #[cfg(feature = "e2ee-per-participant")]
         e2ee_to_device_guard,
-        #[cfg(feature = "e2ee-per-participant")]
-        to_device_probe_guard,
-        #[cfg(feature = "e2ee-per-participant")]
-        room_message_probe_guard,
         driver_handle,
     })
 }
@@ -481,11 +483,7 @@ struct RtcLiveKitRuntime {
     #[cfg(feature = "experimental-widgets")]
     shutdown_membership_state_key: Option<CallMemberStateKey>,
     #[cfg(feature = "e2ee-per-participant")]
-    e2ee_to_device_guard: Option<EventHandlerDropGuard>,
-    #[cfg(feature = "e2ee-per-participant")]
-    to_device_probe_guard: EventHandlerDropGuard,
-    #[cfg(feature = "e2ee-per-participant")]
-    room_message_probe_guard: EventHandlerDropGuard,
+    e2ee_to_device_guard: EventHandlerDropGuard,
     driver_handle: tokio::task::JoinHandle<anyhow::Result<DriverState>>,
 }
 
@@ -604,56 +602,6 @@ fn via_servers_from_env() -> anyhow::Result<Vec<OwnedServerName>> {
         .collect()
 }
 
-#[cfg(feature = "e2ee-per-participant")]
-fn register_any_to_device_probe_handler(client: &Client) -> EventHandlerDropGuard {
-    info!("registering probe handler for all to-device events");
-
-    let handle = client.add_event_handler(move |raw: Raw<AnyToDeviceEvent>| async move {
-        let event_type = raw
-            .get_field::<String>("type")
-            .ok()
-            .flatten()
-            .unwrap_or_else(|| "<missing>".to_owned());
-        let sender = raw
-            .get_field::<String>("sender")
-            .ok()
-            .flatten()
-            .unwrap_or_else(|| "<missing>".to_owned());
-        info!(event_type, sender, "probe observed to-device event");
-    });
-
-    client.event_handler_drop_guard(handle)
-}
-
-#[cfg(feature = "e2ee-per-participant")]
-fn register_room_message_key_probe_handler(
-    client: &Client,
-    room_id: OwnedRoomId,
-) -> EventHandlerDropGuard {
-    info!(%room_id, "registering room message-like probe for encryption keys");
-
-    let room_id_for_handler = room_id.clone();
-    let handle = client.add_room_event_handler(
-        &room_id_for_handler,
-        move |raw: Raw<AnySyncMessageLikeEvent>| {
-            let room_id = room_id.clone();
-            async move {
-                let event_type = raw
-                    .get_field::<String>("type")
-                    .ok()
-                    .flatten()
-                    .unwrap_or_else(|| "<missing>".to_owned());
-
-                if event_type == "io.element.call.encryption_keys" {
-                    info!(%room_id, "probe observed room message-like encryption key event");
-                }
-            }
-        },
-    );
-
-    client.event_handler_drop_guard(handle)
-}
-
 struct DriverState {
     room: Room,
     #[cfg(all(feature = "v4l2", target_os = "linux"))]
@@ -696,10 +644,9 @@ async fn set_video_stream_enabled(
                     (room_handle, state.v4l2_config.as_ref().cloned())
                 {
                     info!(device = %config.device, "starting V4L2 camera publisher");
-                    let publisher =
-                        V4l2CameraPublisher::start(room_handle, config)
-                            .await
-                            .map_err(|err| LiveKitError::connector(V4l2PublishError(err)))?;
+                    let publisher = V4l2CameraPublisher::start(room_handle, config)
+                        .await
+                        .map_err(|err| LiveKitError::connector(V4l2PublishError(err)))?;
                     state.v4l2_publisher = Some(publisher);
                 }
             }
