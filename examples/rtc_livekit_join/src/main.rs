@@ -27,6 +27,8 @@ use matrix_sdk_rtc_livekit::LiveKitResult;
 #[cfg(feature = "e2ee-per-participant")]
 use matrix_sdk_rtc_livekit::livekit::id::ParticipantIdentity;
 #[cfg(feature = "e2ee-per-participant")]
+use matrix_sdk_rtc_livekit::livekit::e2ee::key_provider::{KeyDerivationFunction, KeyProvider, KeyProviderOptions};
+#[cfg(feature = "e2ee-per-participant")]
 use matrix_sdk_rtc_livekit::per_participant::{
     E2eeRoomOptionsProvider, PerParticipantE2eeContext, build_per_participant_e2ee,
     per_participant_key_grace_period_from_env, register_e2ee_to_device_handler,
@@ -377,23 +379,28 @@ async fn run_rtc_livekit_join(client: Client) -> anyhow::Result<RtcLiveKitRuntim
         }
     }
     #[cfg(feature = "e2ee-per-participant")]
-    let e2ee_to_device_guard = if let Some(context) = e2ee_context.as_ref() {
-        info!(
-            room_id = %room.room_id(),
-            "registering per-participant E2EE to-device key handler"
-        );
-        Some(register_e2ee_to_device_handler(
-            &client,
-            room.room_id().to_owned(),
-            Arc::clone(&context.key_provider),
-        ))
+    let e2ee_to_device_key_provider = if let Some(context) = e2ee_context.as_ref() {
+        Arc::clone(&context.key_provider)
     } else {
         warn!(
             room_id = %room.room_id(),
-            "per-participant E2EE context unavailable; to-device key handler not registered"
+            "per-participant E2EE context unavailable; registering to-device handler with fallback key provider"
         );
-        None
+        let mut fallback_options = KeyProviderOptions::default();
+        fallback_options.ratchet_window_size = 10;
+        fallback_options.key_ring_size = 256;
+        fallback_options.key_derivation_function = KeyDerivationFunction::HKDF;
+        Arc::new(KeyProvider::new(fallback_options))
     };
+    info!(
+        room_id = %room.room_id(),
+        "registering per-participant E2EE to-device key handler (kept alive via EventHandlerDropGuard)"
+    );
+    let e2ee_to_device_guard = register_e2ee_to_device_handler(
+        &client,
+        room.room_id().to_owned(),
+        e2ee_to_device_key_provider,
+    );
     #[cfg(feature = "e2ee-per-participant")]
     if let Some(context) = e2ee_context.as_ref() {
         spawn_periodic_e2ee_key_resend(room.clone(), context.clone());
@@ -476,7 +483,7 @@ struct RtcLiveKitRuntime {
     #[cfg(feature = "experimental-widgets")]
     shutdown_membership_state_key: Option<CallMemberStateKey>,
     #[cfg(feature = "e2ee-per-participant")]
-    e2ee_to_device_guard: Option<EventHandlerDropGuard>,
+    e2ee_to_device_guard: EventHandlerDropGuard,
     driver_handle: tokio::task::JoinHandle<anyhow::Result<DriverState>>,
 }
 
