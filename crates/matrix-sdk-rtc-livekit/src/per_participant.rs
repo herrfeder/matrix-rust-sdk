@@ -177,23 +177,45 @@ pub fn register_e2ee_to_device_handler(
         let room_id = room_id.clone();
         let seen_first_callback = seen_first_callback.clone();
         async move {
+            let observed_event_type = raw
+                .get_field::<String>("type")
+                .ok()
+                .flatten()
+                .unwrap_or_else(|| "<missing>".to_owned());
+
             if !seen_first_callback.swap(true, std::sync::atomic::Ordering::Relaxed) {
                 info!(
                     expected_room_id = %room_id,
                     "per-participant E2EE to-device handler callback triggered"
                 );
             }
-            let Ok(event_map) =
-                raw.deserialize_as::<serde_json::Map<std::string::String, serde_json::Value>>()
-            else {
-                return;
-            };
-            let Ok(event) =
-                serde_json::from_value::<IncomingKeyToDeviceEvent>(serde_json::Value::Object(
-                    event_map,
-                ))
-            else {
-                return;
+
+            let event_map =
+                match raw.deserialize_as::<serde_json::Map<std::string::String, serde_json::Value>>()
+                {
+                    Ok(event_map) => event_map,
+                    Err(err) => {
+                        warn!(
+                            event_type = %observed_event_type,
+                            ?err,
+                            "failed to deserialize raw to-device event into JSON map"
+                        );
+                        return;
+                    }
+                };
+            let event_value = serde_json::Value::Object(event_map);
+            let event = match serde_json::from_value::<IncomingKeyToDeviceEvent>(event_value.clone())
+            {
+                Ok(event) => event,
+                Err(err) => {
+                    warn!(
+                        event_type = %observed_event_type,
+                        ?err,
+                        raw_event = ?event_value,
+                        "failed to parse to-device event as IncomingKeyToDeviceEvent"
+                    );
+                    return;
+                }
             };
 
             if event.event_type != "io.element.call.encryption_keys" {
