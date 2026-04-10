@@ -222,9 +222,36 @@ pub fn register_e2ee_to_device_handler(
                 return;
             }
 
+            let sender_device_id = event
+                .content
+                .device_id
+                .as_deref()
+                .or_else(|| {
+                    event
+                        .content
+                        .member
+                        .as_ref()
+                        .and_then(|member| member.claimed_device_id.as_deref())
+                })
+                .or_else(|| {
+                    event
+                        .sender_device_keys
+                        .as_ref()
+                        .and_then(|sender_device_keys| sender_device_keys.device_id.as_deref())
+                });
+            let Some(sender_device_id) = sender_device_id else {
+                warn!(
+                    sender = %event.sender,
+                    event_room_id = %event.content.room_id,
+                    expected_room_id = %room_id,
+                    "ignoring encryption key event without sender device id"
+                );
+                return;
+            };
+
             info!(
                 sender = %event.sender,
-                sender_device = %event.content.device_id,
+                sender_device = %sender_device_id,
                 event_room_id = %event.content.room_id,
                 expected_room_id = %room_id,
                 key_count = event.content.keys.len(),
@@ -233,7 +260,7 @@ pub fn register_e2ee_to_device_handler(
             if event.content.room_id != room_id.as_str() {
                 warn!(
                     sender = %event.sender,
-                    sender_device = %event.content.device_id,
+                    sender_device = %sender_device_id,
                     event_room_id = %event.content.room_id,
                     expected_room_id = %room_id,
                     "ignoring encryption key event for different room"
@@ -241,8 +268,7 @@ pub fn register_e2ee_to_device_handler(
                 return;
             }
 
-            let identity =
-                ParticipantIdentity(format!("{}:{}", event.sender, event.content.device_id));
+            let identity = ParticipantIdentity(format!("{}:{}", event.sender, sender_device_id));
             for key_entry in event.content.keys {
                 let key_bytes = STANDARD_NO_PAD
                     .decode(&key_entry.key)
@@ -277,14 +303,26 @@ struct IncomingKeyToDeviceEvent {
     event_type: String,
     sender: String,
     content: IncomingKeyToDeviceContent,
+    sender_device_keys: Option<IncomingSenderDeviceKeys>,
 }
 
 #[derive(Deserialize)]
 struct IncomingKeyToDeviceContent {
     room_id: String,
-    device_id: String,
+    device_id: Option<String>,
+    member: Option<IncomingKeyMember>,
     #[serde(deserialize_with = "deserialize_key_entries")]
     keys: Vec<IncomingKeyEntry>,
+}
+
+#[derive(Deserialize)]
+struct IncomingKeyMember {
+    claimed_device_id: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct IncomingSenderDeviceKeys {
+    device_id: Option<String>,
 }
 
 #[derive(Deserialize)]
