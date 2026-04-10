@@ -377,13 +377,23 @@ async fn run_rtc_livekit_join(client: Client) -> anyhow::Result<RtcLiveKitRuntim
         }
     }
     #[cfg(feature = "e2ee-per-participant")]
-    let e2ee_to_device_guard = e2ee_context.as_ref().map(|context| {
-        register_e2ee_to_device_handler(
+    let e2ee_to_device_guard = if let Some(context) = e2ee_context.as_ref() {
+        info!(
+            room_id = %room.room_id(),
+            "registering per-participant E2EE to-device key handler"
+        );
+        Some(register_e2ee_to_device_handler(
             &client,
             room.room_id().to_owned(),
             Arc::clone(&context.key_provider),
-        )
-    });
+        ))
+    } else {
+        warn!(
+            room_id = %room.room_id(),
+            "per-participant E2EE context unavailable; to-device key handler not registered"
+        );
+        None
+    };
     #[cfg(feature = "e2ee-per-participant")]
     if let Some(context) = e2ee_context.as_ref() {
         spawn_periodic_e2ee_key_resend(room.clone(), context.clone());

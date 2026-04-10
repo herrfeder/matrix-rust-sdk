@@ -188,9 +188,26 @@ pub fn register_e2ee_to_device_handler(
                 return;
             };
 
-            if event.event_type != "io.element.call.encryption_keys"
-                || event.content.room_id != room_id.as_str()
-            {
+            if event.event_type != "io.element.call.encryption_keys" {
+                return;
+            }
+
+            info!(
+                sender = %event.sender,
+                sender_device = %event.content.device_id,
+                event_room_id = %event.content.room_id,
+                expected_room_id = %room_id,
+                key_count = event.content.keys.len(),
+                "received io.element.call.encryption_keys to-device event"
+            );
+            if event.content.room_id != room_id.as_str() {
+                warn!(
+                    sender = %event.sender,
+                    sender_device = %event.content.device_id,
+                    event_room_id = %event.content.room_id,
+                    expected_room_id = %room_id,
+                    "ignoring encryption key event for different room"
+                );
                 return;
             }
 
