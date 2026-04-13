@@ -183,13 +183,6 @@ pub fn register_e2ee_to_device_handler(
                 .flatten()
                 .unwrap_or_else(|| "<missing>".to_owned());
 
-            if !seen_first_callback.swap(true, std::sync::atomic::Ordering::Relaxed) {
-                debug!(
-                    expected_room_id = %room_id,
-                    "per-participant E2EE to-device handler callback triggered"
-                );
-            }
-
             let event_map =
                 match raw.deserialize_as::<serde_json::Map<std::string::String, serde_json::Value>>()
                 {
@@ -239,15 +232,6 @@ pub fn register_e2ee_to_device_handler(
                         .as_ref()
                         .and_then(|sender_device_keys| sender_device_keys.device_id.as_deref())
                 });
-            let Some(sender_device_id) = sender_device_id else {
-                warn!(
-                    sender = %event.sender,
-                    event_room_id = %event.content.room_id,
-                    expected_room_id = %room_id,
-                    "ignoring encryption key event without sender device id"
-                );
-                return;
-            };
 
             debug!(
                 sender = %event.sender,
