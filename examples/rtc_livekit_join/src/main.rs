@@ -49,25 +49,6 @@ mod videosource;
 #[cfg(all(feature = "v4l2", target_os = "linux"))]
 use videosource::{V4l2CameraPublisher, V4l2Config, V4l2PublishError, v4l2_config_from_env};
 
-struct EnvLiveKitTokenProvider {
-    token: String,
-}
-
-struct DefaultRoomOptionsProvider;
-
-#[async_trait::async_trait]
-impl LiveKitTokenProvider for EnvLiveKitTokenProvider {
-    async fn token(&self, _room: &Room) -> LiveKitResult<String> {
-        Ok(self.token.clone())
-    }
-}
-
-impl LiveKitRoomOptionsProvider for DefaultRoomOptionsProvider {
-    fn room_options(&self) -> RoomOptions {
-        RoomOptions::default()
-    }
-}
-
 #[cfg(not(all(feature = "v4l2", target_os = "linux")))]
 fn v4l2_config_from_env() -> anyhow::Result<()> {
     Ok(())

@@ -21,7 +21,7 @@ use ruma::serde::Raw;
 use ruma::{OwnedRoomId, events::AnyToDeviceEvent};
 use serde::Deserialize;
 use thiserror::Error;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::LiveKitRoomOptionsProvider;
 
