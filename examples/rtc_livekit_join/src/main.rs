@@ -49,6 +49,26 @@ mod videosource;
 #[cfg(all(feature = "v4l2", target_os = "linux"))]
 use videosource::{V4l2CameraPublisher, V4l2Config, V4l2PublishError, v4l2_config_from_env};
 
+struct EnvLiveKitTokenProvider {
+    token: String,
+}
+
+struct DefaultRoomOptionsProvider;
+
+#[async_trait::async_trait]
+impl LiveKitTokenProvider for EnvLiveKitTokenProvider {
+    async fn token(&self, _room: &Room) -> LiveKitResult<String> {
+        Ok(self.token.clone())
+    }
+}
+
+impl LiveKitRoomOptionsProvider for DefaultRoomOptionsProvider {
+    fn room_options(&self) -> RoomOptions {
+        RoomOptions::default()
+    }
+}
+
+
 #[cfg(not(all(feature = "v4l2", target_os = "linux")))]
 fn v4l2_config_from_env() -> anyhow::Result<()> {
     Ok(())
@@ -212,14 +232,6 @@ async fn sync(client: Client) -> anyhow::Result<()> {
     // messages. If the `StateStore` finds saved state in the location given the
     // initial sync will be skipped in favor of loading state from the store
     let sync_token = client.sync_once(SyncSettings::default()).await.unwrap().next_batch;
-
-    // now that we've synced, let's attach a handler for incoming room messages, so
-    // we can react on it
-    //client.add_event_handler(
-    //    |event: OriginalSyncRoomMessageEvent, room: Room, client: Client| async move {
-    //        on_room_message(event, room, client).await;
-    //    },
-    //);
 
     // since we called `sync_once` before we entered our sync loop we must pass
     // that sync token to `sync`

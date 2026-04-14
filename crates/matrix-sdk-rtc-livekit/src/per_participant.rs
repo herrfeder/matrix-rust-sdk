@@ -233,6 +233,16 @@ pub fn register_e2ee_to_device_handler(
                         .and_then(|sender_device_keys| sender_device_keys.device_id.as_deref())
                 });
 
+            let Some(sender_device_id) = sender_device_id else {
+                warn!(
+                    sender = %event.sender,
+                    event_room_id = %event.content.room_id,
+                    expected_room_id = %room_id,
+                    "ignoring encryption key event without a sender device id"
+                );
+                return;
+            };
+
             debug!(
                 sender = %event.sender,
                 sender_device = %sender_device_id,
