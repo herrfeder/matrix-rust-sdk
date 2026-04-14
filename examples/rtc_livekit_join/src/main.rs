@@ -1,6 +1,5 @@
 #![recursion_limit = "256"]
 
-use std::sync::Arc;
 use std::{env, fs};
 
 use matrix_sdk::{
@@ -25,19 +24,14 @@ use matrix_sdk::widget::{
 use matrix_sdk_rtc_livekit::LiveKitError;
 use matrix_sdk_rtc_livekit::LiveKitResult;
 #[cfg(feature = "e2ee-per-participant")]
-use matrix_sdk_rtc_livekit::livekit::id::ParticipantIdentity;
-#[cfg(feature = "e2ee-per-participant")]
-use matrix_sdk_rtc_livekit::livekit::e2ee::key_provider::{KeyDerivationFunction, KeyProvider, KeyProviderOptions};
-#[cfg(feature = "e2ee-per-participant")]
 use matrix_sdk_rtc_livekit::per_participant::{
-    E2eeRoomOptionsProvider, PerParticipantE2eeContext, build_per_participant_e2ee,
-    per_participant_key_grace_period_from_env, register_e2ee_to_device_handler,
-    send_per_participant_keys, spawn_livekit_e2ee_event_resend,
+    PerParticipantE2eeContext, per_participant_key_grace_period_from_env,
+    prepare_per_participant_e2ee, send_per_participant_keys, spawn_livekit_e2ee_event_resend,
 };
 use matrix_sdk_rtc_livekit::{
-    LiveKitConnectionUpdate, LiveKitRoomOptionsProvider, LiveKitSdkConnector, LiveKitTokenProvider,
-    Room as LivekitRoom, RoomOptions, handle_connection_update as handle_livekit_connection_update,
-    resolve_connection_details, run_livekit_driver_with_handler,
+    DefaultRoomOptionsProvider, LiveKitConnectionUpdate, LiveKitRoomOptionsProvider,
+    Room as LivekitRoom, handle_connection_update as handle_livekit_connection_update,
+    prepare_livekit_sdk_connector, run_livekit_driver_with_handler,
 };
 #[cfg(feature = "experimental-widgets")]
 use ruma::events::call::member::CallMemberStateKey;
@@ -48,26 +42,6 @@ use uuid::Uuid;
 mod videosource;
 #[cfg(all(feature = "v4l2", target_os = "linux"))]
 use videosource::{V4l2CameraPublisher, V4l2Config, V4l2PublishError, v4l2_config_from_env};
-
-struct EnvLiveKitTokenProvider {
-    token: String,
-}
-
-struct DefaultRoomOptionsProvider;
-
-#[async_trait::async_trait]
-impl LiveKitTokenProvider for EnvLiveKitTokenProvider {
-    async fn token(&self, _room: &Room) -> LiveKitResult<String> {
-        Ok(self.token.clone())
-    }
-}
-
-impl LiveKitRoomOptionsProvider for DefaultRoomOptionsProvider {
-    fn room_options(&self) -> RoomOptions {
-        RoomOptions::default()
-    }
-}
-
 
 #[cfg(not(all(feature = "v4l2", target_os = "linux")))]
 fn v4l2_config_from_env() -> anyhow::Result<()> {
@@ -331,75 +305,17 @@ async fn run_rtc_livekit_join(client: Client) -> anyhow::Result<RtcLiveKitRuntim
     let widget: Option<()> = None;
 
     let static_livekit_token = optional_env("LIVEKIT_TOKEN");
-    let connection_details = resolve_connection_details(
-        &client,
-        &room,
-        livekit_sfu_get_url.as_deref(),
-        livekit_service_url_override.as_deref(),
-        static_livekit_token.as_deref(),
-    )
-    .await
-    .context("resolve LiveKit connection details")?;
-    let livekit_token = connection_details.token.clone();
-    let service_url = connection_details
-        .authenticated_service_url()
-        .context("attach access_token to LiveKit service url")?;
-
-    let token_provider = EnvLiveKitTokenProvider { token: livekit_token.clone() };
     #[cfg(feature = "e2ee-per-participant")]
-    let e2ee_context = build_per_participant_e2ee(
+    let prepared_e2ee = prepare_per_participant_e2ee(
         &room,
         bool_env("PER_PARTICIPANT_FORCE_BACKUP_DOWNLOAD"),
         retry_attempts_from_env("PER_PARTICIPANT_KEY_RETRIES", 0),
         std::time::Duration::from_secs(1),
+        retry_seconds_from_env("PER_PARTICIPANT_KEY_RESEND_SECS", 0),
     )
     .await?;
     #[cfg(feature = "e2ee-per-participant")]
-    if let Some(context) = e2ee_context.as_ref() {
-        if let (Some(user_id), Some(device_id)) = (client.user_id(), client.device_id()) {
-            let identity = ParticipantIdentity(format!("{user_id}:{device_id}"));
-            let key_set = context.key_provider.set_key(
-                &identity,
-                context.key_index,
-                context.local_key.clone(),
-            );
-            info!(
-                %identity,
-                key_index = context.key_index,
-                key_set,
-                "seeded local per-participant E2EE key_provider key before LiveKit connect"
-            );
-        }
-    }
-    #[cfg(feature = "e2ee-per-participant")]
-    let e2ee_to_device_key_provider = if let Some(context) = e2ee_context.as_ref() {
-        Arc::clone(&context.key_provider)
-    } else {
-        warn!(
-            room_id = %room.room_id(),
-            "per-participant E2EE context unavailable; registering to-device handler with fallback key provider"
-        );
-        let mut fallback_options = KeyProviderOptions::default();
-        fallback_options.ratchet_window_size = 10;
-        fallback_options.key_ring_size = 256;
-        fallback_options.key_derivation_function = KeyDerivationFunction::HKDF;
-        Arc::new(KeyProvider::new(fallback_options))
-    };
-    info!(
-        room_id = %room.room_id(),
-        "registering per-participant E2EE to-device key handler (kept alive via EventHandlerDropGuard)"
-    );
-    let e2ee_to_device_guard = register_e2ee_to_device_handler(
-        &client,
-        room.room_id().to_owned(),
-        e2ee_to_device_key_provider,
-    );
-    #[cfg(feature = "e2ee-per-participant")]
-    if let Some(context) = e2ee_context.as_ref() {
-        spawn_periodic_e2ee_key_resend(room.clone(), context.clone());
-    }
-    #[cfg(feature = "e2ee-per-participant")]
-    let room_options_provider = E2eeRoomOptionsProvider { e2ee: e2ee_context.clone() };
+    let room_options_provider = prepared_e2ee.room_options_provider;
     #[cfg(not(feature = "e2ee-per-participant"))]
     let room_options_provider = DefaultRoomOptionsProvider;
     #[cfg(not(feature = "e2ee-per-participant"))]
@@ -413,7 +329,23 @@ async fn run_rtc_livekit_join(client: Client) -> anyhow::Result<RtcLiveKitRuntim
         has_encryption_key_provider = resolved_room_options.encryption.is_some(),
         "configured LiveKit room options provider"
     );
-    let connector = LiveKitSdkConnector::new(token_provider, room_options_provider);
+    let prepared_livekit = prepare_livekit_sdk_connector(
+        &client,
+        &room,
+        livekit_sfu_get_url.as_deref(),
+        livekit_service_url_override.as_deref(),
+        static_livekit_token.as_deref(),
+        room_options_provider,
+    )
+    .await
+    .context("prepare LiveKit SDK connector")?;
+    let service_url = prepared_livekit.service_url.clone();
+    let token_len = prepared_livekit.token_len;
+
+    #[cfg(feature = "e2ee-per-participant")]
+    let e2ee_to_device_guard = prepared_e2ee.to_device_guard;
+    #[cfg(feature = "e2ee-per-participant")]
+    let e2ee_context_for_driver = prepared_e2ee.context;
 
     #[cfg(feature = "experimental-widgets")]
     let shutdown_membership_state_key = if widget.is_some() {
@@ -428,7 +360,7 @@ async fn run_rtc_livekit_join(client: Client) -> anyhow::Result<RtcLiveKitRuntim
     info!(
         room_id = ?room.room_id(),
         service_url = %service_url,
-        token_len = livekit_token.len(),
+        token_len,
         "starting LiveKit driver"
     );
 
@@ -437,14 +369,14 @@ async fn run_rtc_livekit_join(client: Client) -> anyhow::Result<RtcLiveKitRuntim
     let driver_handle = tokio::spawn(async move {
         run_livekit_driver_with_handler(
             room_for_driver,
-            &connector,
+            &prepared_livekit.connector,
             &service_url_for_driver,
             build_driver_state(
                 room,
                 #[cfg(all(feature = "v4l2", target_os = "linux"))]
                 v4l2_config,
                 #[cfg(feature = "e2ee-per-participant")]
-                e2ee_context,
+                e2ee_context_for_driver,
             ),
             |state, update| async move {
                 handle_livekit_connection_update(state, update, &handle_driver_connection_update)
@@ -553,32 +485,6 @@ fn retry_seconds_from_env(name: &str, default: u64) -> u64 {
     optional_env(name).and_then(|value| value.parse::<u64>().ok()).unwrap_or(default)
 }
 
-#[cfg(feature = "e2ee-per-participant")]
-fn spawn_periodic_e2ee_key_resend(room: Room, context: PerParticipantE2eeContext) {
-    let interval_secs = retry_seconds_from_env("PER_PARTICIPANT_KEY_RESEND_SECS", 0);
-    if interval_secs == 0 {
-        return;
-    }
-    tokio::spawn(async move {
-        let mut interval = tokio::time::interval(std::time::Duration::from_secs(interval_secs));
-        loop {
-            interval.tick().await;
-            info!(
-                interval_secs,
-                key_index = context.key_index,
-                "periodic per-participant E2EE key resend"
-            );
-            if let Err(err) =
-                send_per_participant_keys(&room, context.key_index, &context.local_key, None).await
-            {
-                info!(?err, "failed to resend per-participant E2EE keys");
-            }
-        }
-    });
-}
-
-#[cfg(not(feature = "e2ee-per-participant"))]
-fn spawn_periodic_e2ee_key_resend(_room: Room, _context: ()) {}
 
 fn via_servers_from_env() -> anyhow::Result<Vec<OwnedServerName>> {
     let value = match env::var("VIA_SERVERS") {
