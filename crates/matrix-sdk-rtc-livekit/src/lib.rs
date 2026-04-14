@@ -259,6 +259,41 @@ pub async fn resolve_connection_details(
     Ok(LiveKitConnectionDetails { service_url, token })
 }
 
+/// Prepared SDK connector configuration for running the LiveKit room driver.
+#[derive(Debug)]
+pub struct PreparedLiveKitSdkConnector<O: LiveKitRoomOptionsProvider> {
+    /// LiveKit service URL (including access token query parameter when needed).
+    pub service_url: String,
+    /// SDK connector configured with token and room options providers.
+    pub connector: LiveKitSdkConnector<EnvLiveKitTokenProvider, O>,
+    /// Length of the resolved token, useful for structured logging.
+    pub token_len: usize,
+}
+
+/// Resolve connection details and build a [`LiveKitSdkConnector`] ready for driver execution.
+pub async fn prepare_livekit_sdk_connector<O>(
+    client: &Client,
+    room: &MatrixRoom,
+    sfu_get_url: Option<&str>,
+    service_url_override: Option<&str>,
+    static_token: Option<&str>,
+    room_options_provider: O,
+) -> LiveKitResult<PreparedLiveKitSdkConnector<O>>
+where
+    O: LiveKitRoomOptionsProvider,
+{
+    let connection_details =
+        resolve_connection_details(client, room, sfu_get_url, service_url_override, static_token)
+            .await?;
+    let token = connection_details.token;
+    let token_len = token.len();
+    let service_url = connection_details.authenticated_service_url()?;
+    let token_provider = EnvLiveKitTokenProvider::new(token);
+    let connector = LiveKitSdkConnector::new(token_provider, room_options_provider);
+
+    Ok(PreparedLiveKitSdkConnector { service_url, connector, token_len })
+}
+
 async fn request_openid_token(
     client: &Client,
 ) -> LiveKitResult<request_openid_token::v3::Response> {

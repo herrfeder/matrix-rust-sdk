@@ -4,23 +4,26 @@ use std::sync::Arc;
 use std::{env, fs};
 
 use matrix_sdk::{
+    Client, RoomState,
     config::SyncSettings,
     event_handler::EventHandlerDropGuard,
     room::Room,
     ruma::{OwnedRoomId, OwnedServerName, RoomId, RoomOrAliasId, ServerName},
-    Client, RoomState,
 };
 use std::borrow::ToOwned;
 use std::time::Duration;
 
 use matrix_sdk::encryption::secret_storage::SecretStore;
 
-use anyhow::{anyhow, Context};
+use anyhow::{Context, anyhow};
 #[cfg(feature = "experimental-widgets")]
 use matrix_sdk::widget::{
-    publish_call_membership_via_widget, send_hangup_via_widget, start_element_call_widget,
     ClientProperties, ElementCallWidget, ElementCallWidgetOptions, EncryptionSystem, Intent,
+    publish_call_membership_via_widget, send_hangup_via_widget, start_element_call_widget,
 };
+#[cfg(all(feature = "v4l2", target_os = "linux"))]
+use matrix_sdk_rtc_livekit::LiveKitError;
+use matrix_sdk_rtc_livekit::LiveKitResult;
 #[cfg(feature = "e2ee-per-participant")]
 use matrix_sdk_rtc_livekit::livekit::e2ee::key_provider::{
     KeyDerivationFunction, KeyProvider, KeyProviderOptions,
@@ -29,17 +32,14 @@ use matrix_sdk_rtc_livekit::livekit::e2ee::key_provider::{
 use matrix_sdk_rtc_livekit::livekit::id::ParticipantIdentity;
 #[cfg(feature = "e2ee-per-participant")]
 use matrix_sdk_rtc_livekit::per_participant::{
-    build_per_participant_e2ee, per_participant_key_grace_period_from_env,
-    register_e2ee_to_device_handler, send_per_participant_keys, spawn_livekit_e2ee_event_resend,
-    E2eeRoomOptionsProvider, PerParticipantE2eeContext,
+    E2eeRoomOptionsProvider, PerParticipantE2eeContext, build_per_participant_e2ee,
+    per_participant_key_grace_period_from_env, register_e2ee_to_device_handler,
+    send_per_participant_keys, spawn_livekit_e2ee_event_resend,
 };
-#[cfg(all(feature = "v4l2", target_os = "linux"))]
-use matrix_sdk_rtc_livekit::LiveKitError;
-use matrix_sdk_rtc_livekit::LiveKitResult;
 use matrix_sdk_rtc_livekit::{
-    handle_connection_update as handle_livekit_connection_update, resolve_connection_details,
-    run_livekit_driver_with_handler, DefaultRoomOptionsProvider, EnvLiveKitTokenProvider,
-    LiveKitConnectionUpdate, LiveKitRoomOptionsProvider, LiveKitSdkConnector, Room as LivekitRoom,
+    DefaultRoomOptionsProvider, LiveKitConnectionUpdate, LiveKitRoomOptionsProvider,
+    Room as LivekitRoom, handle_connection_update as handle_livekit_connection_update,
+    prepare_livekit_sdk_connector, run_livekit_driver_with_handler,
 };
 #[cfg(feature = "experimental-widgets")]
 use ruma::events::call::member::CallMemberStateKey;
@@ -49,7 +49,7 @@ use uuid::Uuid;
 #[cfg(all(feature = "v4l2", target_os = "linux"))]
 mod videosource;
 #[cfg(all(feature = "v4l2", target_os = "linux"))]
-use videosource::{v4l2_config_from_env, V4l2CameraPublisher, V4l2Config, V4l2PublishError};
+use videosource::{V4l2CameraPublisher, V4l2Config, V4l2PublishError, v4l2_config_from_env};
 
 #[cfg(not(all(feature = "v4l2", target_os = "linux")))]
 fn v4l2_config_from_env() -> anyhow::Result<()> {
@@ -313,21 +313,6 @@ async fn run_rtc_livekit_join(client: Client) -> anyhow::Result<RtcLiveKitRuntim
     let widget: Option<()> = None;
 
     let static_livekit_token = optional_env("LIVEKIT_TOKEN");
-    let connection_details = resolve_connection_details(
-        &client,
-        &room,
-        livekit_sfu_get_url.as_deref(),
-        livekit_service_url_override.as_deref(),
-        static_livekit_token.as_deref(),
-    )
-    .await
-    .context("resolve LiveKit connection details")?;
-    let livekit_token = connection_details.token.clone();
-    let service_url = connection_details
-        .authenticated_service_url()
-        .context("attach access_token to LiveKit service url")?;
-
-    let token_provider = EnvLiveKitTokenProvider::new(livekit_token.clone());
     #[cfg(feature = "e2ee-per-participant")]
     let e2ee_context = build_per_participant_e2ee(
         &room,
@@ -395,7 +380,18 @@ async fn run_rtc_livekit_join(client: Client) -> anyhow::Result<RtcLiveKitRuntim
         has_encryption_key_provider = resolved_room_options.encryption.is_some(),
         "configured LiveKit room options provider"
     );
-    let connector = LiveKitSdkConnector::new(token_provider, room_options_provider);
+    let prepared_livekit = prepare_livekit_sdk_connector(
+        &client,
+        &room,
+        livekit_sfu_get_url.as_deref(),
+        livekit_service_url_override.as_deref(),
+        static_livekit_token.as_deref(),
+        room_options_provider,
+    )
+    .await
+    .context("prepare LiveKit SDK connector")?;
+    let service_url = prepared_livekit.service_url.clone();
+    let token_len = prepared_livekit.token_len;
 
     #[cfg(feature = "experimental-widgets")]
     let shutdown_membership_state_key = if widget.is_some() {
@@ -410,7 +406,7 @@ async fn run_rtc_livekit_join(client: Client) -> anyhow::Result<RtcLiveKitRuntim
     info!(
         room_id = ?room.room_id(),
         service_url = %service_url,
-        token_len = livekit_token.len(),
+        token_len,
         "starting LiveKit driver"
     );
 
@@ -419,7 +415,7 @@ async fn run_rtc_livekit_join(client: Client) -> anyhow::Result<RtcLiveKitRuntim
     let driver_handle = tokio::spawn(async move {
         run_livekit_driver_with_handler(
             room_for_driver,
-            &connector,
+            &prepared_livekit.connector,
             &service_url_for_driver,
             build_driver_state(
                 room,
