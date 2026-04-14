@@ -167,6 +167,36 @@ where
     }
 }
 
+/// A token provider that always returns a fixed token.
+#[derive(Debug, Clone)]
+pub struct EnvLiveKitTokenProvider {
+    token: String,
+}
+
+impl EnvLiveKitTokenProvider {
+    /// Create a provider from a static token value.
+    pub fn new(token: impl Into<String>) -> Self {
+        Self { token: token.into() }
+    }
+}
+
+#[async_trait]
+impl LiveKitTokenProvider for EnvLiveKitTokenProvider {
+    async fn token(&self, _room: &MatrixRoom) -> LiveKitResult<String> {
+        Ok(self.token.clone())
+    }
+}
+
+/// A room options provider that uses [`RoomOptions::default`].
+#[derive(Debug, Clone, Copy, Default)]
+pub struct DefaultRoomOptionsProvider;
+
+impl LiveKitRoomOptionsProvider for DefaultRoomOptionsProvider {
+    fn room_options(&self) -> RoomOptions {
+        RoomOptions::default()
+    }
+}
+
 /// Connection details used by the LiveKit SDK connector.
 #[derive(Debug, Clone)]
 pub struct LiveKitConnectionDetails {

@@ -4,40 +4,42 @@ use std::sync::Arc;
 use std::{env, fs};
 
 use matrix_sdk::{
-    Client, RoomState,
     config::SyncSettings,
     event_handler::EventHandlerDropGuard,
     room::Room,
     ruma::{OwnedRoomId, OwnedServerName, RoomId, RoomOrAliasId, ServerName},
+    Client, RoomState,
 };
 use std::borrow::ToOwned;
 use std::time::Duration;
 
 use matrix_sdk::encryption::secret_storage::SecretStore;
 
-use anyhow::{Context, anyhow};
+use anyhow::{anyhow, Context};
 #[cfg(feature = "experimental-widgets")]
 use matrix_sdk::widget::{
-    ClientProperties, ElementCallWidget, ElementCallWidgetOptions, EncryptionSystem, Intent,
     publish_call_membership_via_widget, send_hangup_via_widget, start_element_call_widget,
+    ClientProperties, ElementCallWidget, ElementCallWidgetOptions, EncryptionSystem, Intent,
+};
+#[cfg(feature = "e2ee-per-participant")]
+use matrix_sdk_rtc_livekit::livekit::e2ee::key_provider::{
+    KeyDerivationFunction, KeyProvider, KeyProviderOptions,
+};
+#[cfg(feature = "e2ee-per-participant")]
+use matrix_sdk_rtc_livekit::livekit::id::ParticipantIdentity;
+#[cfg(feature = "e2ee-per-participant")]
+use matrix_sdk_rtc_livekit::per_participant::{
+    build_per_participant_e2ee, per_participant_key_grace_period_from_env,
+    register_e2ee_to_device_handler, send_per_participant_keys, spawn_livekit_e2ee_event_resend,
+    E2eeRoomOptionsProvider, PerParticipantE2eeContext,
 };
 #[cfg(all(feature = "v4l2", target_os = "linux"))]
 use matrix_sdk_rtc_livekit::LiveKitError;
 use matrix_sdk_rtc_livekit::LiveKitResult;
-#[cfg(feature = "e2ee-per-participant")]
-use matrix_sdk_rtc_livekit::livekit::id::ParticipantIdentity;
-#[cfg(feature = "e2ee-per-participant")]
-use matrix_sdk_rtc_livekit::livekit::e2ee::key_provider::{KeyDerivationFunction, KeyProvider, KeyProviderOptions};
-#[cfg(feature = "e2ee-per-participant")]
-use matrix_sdk_rtc_livekit::per_participant::{
-    E2eeRoomOptionsProvider, PerParticipantE2eeContext, build_per_participant_e2ee,
-    per_participant_key_grace_period_from_env, register_e2ee_to_device_handler,
-    send_per_participant_keys, spawn_livekit_e2ee_event_resend,
-};
 use matrix_sdk_rtc_livekit::{
-    LiveKitConnectionUpdate, LiveKitRoomOptionsProvider, LiveKitSdkConnector, LiveKitTokenProvider,
-    Room as LivekitRoom, RoomOptions, handle_connection_update as handle_livekit_connection_update,
-    resolve_connection_details, run_livekit_driver_with_handler,
+    handle_connection_update as handle_livekit_connection_update, resolve_connection_details,
+    run_livekit_driver_with_handler, DefaultRoomOptionsProvider, EnvLiveKitTokenProvider,
+    LiveKitConnectionUpdate, LiveKitRoomOptionsProvider, LiveKitSdkConnector, Room as LivekitRoom,
 };
 #[cfg(feature = "experimental-widgets")]
 use ruma::events::call::member::CallMemberStateKey;
@@ -47,27 +49,7 @@ use uuid::Uuid;
 #[cfg(all(feature = "v4l2", target_os = "linux"))]
 mod videosource;
 #[cfg(all(feature = "v4l2", target_os = "linux"))]
-use videosource::{V4l2CameraPublisher, V4l2Config, V4l2PublishError, v4l2_config_from_env};
-
-struct EnvLiveKitTokenProvider {
-    token: String,
-}
-
-struct DefaultRoomOptionsProvider;
-
-#[async_trait::async_trait]
-impl LiveKitTokenProvider for EnvLiveKitTokenProvider {
-    async fn token(&self, _room: &Room) -> LiveKitResult<String> {
-        Ok(self.token.clone())
-    }
-}
-
-impl LiveKitRoomOptionsProvider for DefaultRoomOptionsProvider {
-    fn room_options(&self) -> RoomOptions {
-        RoomOptions::default()
-    }
-}
-
+use videosource::{v4l2_config_from_env, V4l2CameraPublisher, V4l2Config, V4l2PublishError};
 
 #[cfg(not(all(feature = "v4l2", target_os = "linux")))]
 fn v4l2_config_from_env() -> anyhow::Result<()> {
@@ -345,7 +327,7 @@ async fn run_rtc_livekit_join(client: Client) -> anyhow::Result<RtcLiveKitRuntim
         .authenticated_service_url()
         .context("attach access_token to LiveKit service url")?;
 
-    let token_provider = EnvLiveKitTokenProvider { token: livekit_token.clone() };
+    let token_provider = EnvLiveKitTokenProvider::new(livekit_token.clone());
     #[cfg(feature = "e2ee-per-participant")]
     let e2ee_context = build_per_participant_e2ee(
         &room,
