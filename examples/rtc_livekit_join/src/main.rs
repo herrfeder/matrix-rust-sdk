@@ -15,14 +15,12 @@ use std::{env, fs};
 use matrix_sdk::encryption::secret_storage::SecretStore;
 
 use anyhow::{Context, anyhow};
-#[cfg(feature = "experimental-widgets")]
-use matrix_sdk::widget::{ClientProperties, ElementCallWidgetOptions, Intent};
 #[cfg(all(feature = "v4l2", target_os = "linux"))]
 use matrix_sdk_rtc_livekit::LiveKitError;
 use matrix_sdk_rtc_livekit::LiveKitResult;
 #[cfg(feature = "experimental-widgets")]
 use matrix_sdk_rtc_livekit::element_call::{
-    LiveKitElementCallWidget, element_call_encryption_for_room,
+    LiveKitElementCallWidget, start_element_call_widget_for_room,
 };
 #[cfg(feature = "e2ee-per-participant")]
 use matrix_sdk_rtc_livekit::per_participant::{
@@ -251,33 +249,16 @@ async fn run_rtc_livekit_join(client: Client) -> anyhow::Result<RtcLiveKitRuntim
             .context("join room")?,
     };
     let room_for_activation = room.clone();
-    let element_call_url =
-        optional_env("ELEMENT_CALL_URL").or_else(|| optional_env("ELEMENT_CALL_WIDGET"));
+    let element_call_url = optional_env("ELEMENT_CALL_URL");
     #[cfg(feature = "experimental-widgets")]
     let widget = if let Some(element_call_url) = element_call_url {
         info!(%element_call_url, "Element Call widget URL set; starting widget bridge");
 
-        let encryption = element_call_encryption_for_room(&room)
-            .await
-            .context("resolve room encryption mode for element call")?;
-
-        let options = ElementCallWidgetOptions {
-            widget_id: optional_env("ELEMENT_CALL_WIDGET_ID")
-                .unwrap_or_else(|| "element-call".to_owned()),
-            parent_url: optional_env("ELEMENT_CALL_PARENT_URL"),
-            encryption,
-            intent: Intent::JoinExisting,
-            client_properties: ClientProperties::new("matrix-sdk-rtc-livekit-join", None, None),
-        };
-
         Some(
-            LiveKitElementCallWidget::start(room.clone(), element_call_url, options)
+            start_element_call_widget_for_room(room.clone(), element_call_url)
                 .await
                 .context("start element call widget")?,
         )
-    } else if optional_env("ELEMENT_CALL_WIDGET_ID").is_some() {
-        info!("ELEMENT_CALL_WIDGET_ID set but no Element Call URL provided");
-        None
     } else {
         None
     };

@@ -2,7 +2,7 @@ use matrix_sdk::{
     Room as MatrixRoom,
     ruma::events::call::member::CallMemberStateKey,
     widget::{
-        ElementCallWidget, ElementCallWidgetOptions, EncryptionSystem,
+        ClientProperties, ElementCallWidget, ElementCallWidgetOptions, EncryptionSystem, Intent,
         publish_call_membership_via_widget, send_hangup_via_widget, start_element_call_widget,
     },
 };
@@ -28,6 +28,23 @@ pub async fn element_call_encryption_for_room(
     }
 
     Ok(EncryptionSystem::Unencrypted)
+}
+
+
+/// Start Element Call with sensible defaults for a MatrixRTC join flow.
+pub async fn start_element_call_widget_for_room(
+    room: MatrixRoom,
+    element_call_url: impl Into<String>,
+) -> LiveKitResult<LiveKitElementCallWidget> {
+    let options = ElementCallWidgetOptions {
+        widget_id: "element-call".to_owned(),
+        parent_url: None,
+        encryption: element_call_encryption_for_room(&room).await?,
+        intent: Intent::JoinExisting,
+        client_properties: ClientProperties::new("matrix-sdk-rtc-livekit-join", None, None),
+    };
+
+    LiveKitElementCallWidget::start(room, element_call_url, options).await
 }
 
 /// Running Element Call widget integration for a LiveKit room session.
