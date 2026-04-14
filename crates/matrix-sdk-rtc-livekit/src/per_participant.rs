@@ -284,11 +284,9 @@ pub fn register_e2ee_to_device_handler(
     room_id: OwnedRoomId,
     key_provider: Arc<KeyProvider>,
 ) -> EventHandlerDropGuard {
-    let seen_first_callback = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let handle = client.add_event_handler(move |raw: Raw<AnyToDeviceEvent>| {
         let key_provider = Arc::clone(&key_provider);
         let room_id = room_id.clone();
-        let seen_first_callback = seen_first_callback.clone();
         async move {
             let observed_event_type = raw
                 .get_field::<String>("type")
@@ -297,7 +295,7 @@ pub fn register_e2ee_to_device_handler(
                 .unwrap_or_else(|| "<missing>".to_owned());
 
             let event_map =
-                match raw.deserialize_as::<serde_json::Map<std::string::String, serde_json::Value>>()
+                match raw.deserialize_as::<serde_json::Map<String, serde_json::Value>>()
                 {
                     Ok(event_map) => event_map,
                     Err(err) => {

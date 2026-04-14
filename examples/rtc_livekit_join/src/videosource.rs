@@ -2,9 +2,7 @@ use std::sync::Arc;
 use anyhow::{anyhow, Context};
 use matrix_sdk_rtc_livekit::Room as LivekitRoom;
 use tracing::{info, warn};
-use crate::{
-    optional_env,
-};
+use crate::optional_env;
 
 #[cfg(all(feature = "v4l2", target_os = "linux"))]
 #[derive(Clone, Debug)]

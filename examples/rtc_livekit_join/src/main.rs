@@ -1,13 +1,13 @@
 #![recursion_limit = "256"]
 
 use std::{env, fs};
-
+use std::sync::Arc;
 use matrix_sdk::{
     Client, RoomState,
     config::SyncSettings,
     event_handler::EventHandlerDropGuard,
     room::Room,
-    ruma::{OwnedRoomId, OwnedServerName, RoomId, RoomOrAliasId, ServerName},
+    ruma::{OwnedServerName, RoomId, RoomOrAliasId, ServerName},
 };
 use std::borrow::ToOwned;
 use std::time::Duration;
@@ -29,15 +29,13 @@ use matrix_sdk_rtc_livekit::per_participant::{
     prepare_per_participant_e2ee, send_per_participant_keys, spawn_livekit_e2ee_event_resend,
 };
 use matrix_sdk_rtc_livekit::{
-    DefaultRoomOptionsProvider, LiveKitConnectionUpdate, LiveKitRoomOptionsProvider,
+    LiveKitConnectionUpdate, LiveKitRoomOptionsProvider,
     Room as LivekitRoom, handle_connection_update as handle_livekit_connection_update,
     prepare_livekit_sdk_connector, run_livekit_driver_with_handler,
 };
 #[cfg(feature = "experimental-widgets")]
 use ruma::events::call::member::CallMemberStateKey;
 use tracing::{info, warn};
-#[cfg(feature = "experimental-widgets")]
-use uuid::Uuid;
 #[cfg(all(feature = "v4l2", target_os = "linux"))]
 mod videosource;
 #[cfg(all(feature = "v4l2", target_os = "linux"))]
@@ -310,7 +308,7 @@ async fn run_rtc_livekit_join(client: Client) -> anyhow::Result<RtcLiveKitRuntim
         &room,
         bool_env("PER_PARTICIPANT_FORCE_BACKUP_DOWNLOAD"),
         retry_attempts_from_env("PER_PARTICIPANT_KEY_RETRIES", 0),
-        std::time::Duration::from_secs(1),
+        Duration::from_secs(1),
         retry_seconds_from_env("PER_PARTICIPANT_KEY_RESEND_SECS", 0),
     )
     .await?;
