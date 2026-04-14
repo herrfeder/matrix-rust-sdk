@@ -100,6 +100,71 @@ pub fn seed_local_participant_key(client: &Client, e2ee: Option<&PerParticipantE
     }
 }
 
+/// Runtime wiring needed by callers after preparing per-participant E2EE.
+pub struct PreparedPerParticipantE2ee {
+    pub context: Option<PerParticipantE2eeContext>,
+    pub room_options_provider: E2eeRoomOptionsProvider,
+    pub to_device_guard: EventHandlerDropGuard,
+}
+
+/// Periodically resend local per-participant keys.
+pub fn spawn_periodic_e2ee_key_resend(
+    room: Room,
+    context: PerParticipantE2eeContext,
+    interval_secs: u64,
+) {
+    if interval_secs == 0 {
+        return;
+    }
+
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(interval_secs));
+        loop {
+            interval.tick().await;
+            info!(
+                interval_secs,
+                key_index = context.key_index,
+                "periodic per-participant E2EE key resend"
+            );
+            if let Err(err) =
+                send_per_participant_keys(&room, context.key_index, &context.local_key, None).await
+            {
+                info!(?err, "failed to resend per-participant E2EE keys");
+            }
+        }
+    });
+}
+
+/// Build, seed, and wire all per-participant E2EE runtime helpers for a room.
+pub async fn prepare_per_participant_e2ee(
+    room: &Room,
+    force_backup_download: bool,
+    retries: usize,
+    retry_delay: Duration,
+    periodic_resend_secs: u64,
+) -> Result<PreparedPerParticipantE2ee, PerParticipantE2eeError> {
+    let context =
+        build_per_participant_e2ee(room, force_backup_download, retries, retry_delay).await?;
+    seed_local_participant_key(&room.client(), context.as_ref());
+
+    let providers = build_per_participant_providers(room, context.clone());
+    let to_device_guard = register_e2ee_to_device_handler(
+        &room.client(),
+        room.room_id().to_owned(),
+        providers.to_device_key_provider,
+    );
+
+    if let Some(context) = context.as_ref() {
+        spawn_periodic_e2ee_key_resend(room.clone(), context.clone(), periodic_resend_secs);
+    }
+
+    Ok(PreparedPerParticipantE2ee {
+        context,
+        room_options_provider: providers.room_options_provider,
+        to_device_guard,
+    })
+}
+
 #[derive(Debug, Error)]
 pub enum PerParticipantE2eeError {
     #[error("missing device id for per-participant E2EE")]
