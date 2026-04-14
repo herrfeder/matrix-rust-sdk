@@ -17,6 +17,7 @@ default = ["rustls-tls"]
 rustls-tls = ["matrix-sdk/rustls-tls", "livekit/rustls-tls-native-roots"]
 native-tls = ["matrix-sdk/native-tls", "livekit/native-tls"]
 js = ["matrix-sdk/js"]
+experimental-widgets = ["matrix-sdk/experimental-widgets"]
 crypto = [
     "matrix-sdk-crypto",
     "matrix-sdk-base",

@@ -1,7 +1,5 @@
 #![recursion_limit = "256"]
 
-use std::{env, fs};
-use std::sync::Arc;
 use matrix_sdk::{
     Client, RoomState,
     config::SyncSettings,
@@ -10,31 +8,32 @@ use matrix_sdk::{
     ruma::{OwnedServerName, RoomId, RoomOrAliasId, ServerName},
 };
 use std::borrow::ToOwned;
+use std::sync::Arc;
 use std::time::Duration;
+use std::{env, fs};
 
 use matrix_sdk::encryption::secret_storage::SecretStore;
 
 use anyhow::{Context, anyhow};
 #[cfg(feature = "experimental-widgets")]
-use matrix_sdk::widget::{
-    ClientProperties, ElementCallWidget, ElementCallWidgetOptions, EncryptionSystem, Intent,
-    publish_call_membership_via_widget, send_hangup_via_widget, start_element_call_widget,
-};
+use matrix_sdk::widget::{ClientProperties, ElementCallWidgetOptions, Intent};
 #[cfg(all(feature = "v4l2", target_os = "linux"))]
 use matrix_sdk_rtc_livekit::LiveKitError;
 use matrix_sdk_rtc_livekit::LiveKitResult;
+#[cfg(feature = "experimental-widgets")]
+use matrix_sdk_rtc_livekit::element_call::{
+    LiveKitElementCallWidget, element_call_encryption_for_room,
+};
 #[cfg(feature = "e2ee-per-participant")]
 use matrix_sdk_rtc_livekit::per_participant::{
     PerParticipantE2eeContext, per_participant_key_grace_period_from_env,
     prepare_per_participant_e2ee, send_per_participant_keys, spawn_livekit_e2ee_event_resend,
 };
 use matrix_sdk_rtc_livekit::{
-    LiveKitConnectionUpdate, LiveKitRoomOptionsProvider,
-    Room as LivekitRoom, handle_connection_update as handle_livekit_connection_update,
-    prepare_livekit_sdk_connector, run_livekit_driver_with_handler,
+    LiveKitConnectionUpdate, LiveKitRoomOptionsProvider, Room as LivekitRoom,
+    handle_connection_update as handle_livekit_connection_update, prepare_livekit_sdk_connector,
+    run_livekit_driver_with_handler,
 };
-#[cfg(feature = "experimental-widgets")]
-use ruma::events::call::member::CallMemberStateKey;
 use tracing::{info, warn};
 #[cfg(all(feature = "v4l2", target_os = "linux"))]
 mod videosource;
@@ -258,25 +257,9 @@ async fn run_rtc_livekit_join(client: Client) -> anyhow::Result<RtcLiveKitRuntim
     let widget = if let Some(element_call_url) = element_call_url {
         info!(%element_call_url, "Element Call widget URL set; starting widget bridge");
 
-        let encryption_state = room
-            .latest_encryption_state()
+        let encryption = element_call_encryption_for_room(&room)
             .await
-            .context("load room encryption state for element call")?;
-        let encryption = if encryption_state.is_encrypted() {
-            info!("room is encrypted; Element Call will be configured for E2EE");
-            #[cfg(feature = "e2ee-per-participant")]
-            {
-                EncryptionSystem::PerParticipantKeys
-            }
-            #[cfg(not(feature = "e2ee-per-participant"))]
-            {
-                info!("room is encrypted but per-participant E2EE is disabled at compile time");
-                EncryptionSystem::Unencrypted
-            }
-        } else {
-            info!("room is not encrypted; Element Call will be configured unencrypted");
-            EncryptionSystem::Unencrypted
-        };
+            .context("resolve room encryption mode for element call")?;
 
         let options = ElementCallWidgetOptions {
             widget_id: optional_env("ELEMENT_CALL_WIDGET_ID")
@@ -288,7 +271,7 @@ async fn run_rtc_livekit_join(client: Client) -> anyhow::Result<RtcLiveKitRuntim
         };
 
         Some(
-            start_element_call_widget(room.clone(), element_call_url, options)
+            LiveKitElementCallWidget::start(room.clone(), element_call_url, options)
                 .await
                 .context("start element call widget")?,
         )
@@ -345,16 +328,6 @@ async fn run_rtc_livekit_join(client: Client) -> anyhow::Result<RtcLiveKitRuntim
     #[cfg(feature = "e2ee-per-participant")]
     let e2ee_context_for_driver = prepared_e2ee.context;
 
-    #[cfg(feature = "experimental-widgets")]
-    let shutdown_membership_state_key = if widget.is_some() {
-        let own_user_id =
-            client.user_id().context("missing user id for widget shutdown event")?.to_owned();
-        let own_device_id =
-            client.device_id().context("missing device id for widget shutdown event")?.to_owned();
-        Some(CallMemberStateKey::new(own_user_id, Some(own_device_id.to_string()), true))
-    } else {
-        None
-    };
     info!(
         room_id = ?room.room_id(),
         service_url = %service_url,
@@ -390,8 +363,6 @@ async fn run_rtc_livekit_join(client: Client) -> anyhow::Result<RtcLiveKitRuntim
         service_url,
         #[cfg(feature = "experimental-widgets")]
         widget,
-        #[cfg(feature = "experimental-widgets")]
-        shutdown_membership_state_key,
         #[cfg(feature = "e2ee-per-participant")]
         e2ee_to_device_guard,
         driver_handle,
@@ -402,9 +373,7 @@ struct RtcLiveKitRuntime {
     room: Room,
     service_url: String,
     #[cfg(feature = "experimental-widgets")]
-    widget: Option<ElementCallWidget>,
-    #[cfg(feature = "experimental-widgets")]
-    shutdown_membership_state_key: Option<CallMemberStateKey>,
+    widget: Option<LiveKitElementCallWidget>,
     #[cfg(feature = "e2ee-per-participant")]
     e2ee_to_device_guard: EventHandlerDropGuard,
     driver_handle: tokio::task::JoinHandle<anyhow::Result<DriverState>>,
@@ -416,15 +385,13 @@ impl RtcLiveKitRuntime {
         {
             if let Some(widget) = self.widget.as_ref() {
                 if active {
-                    publish_call_membership_via_widget(
-                        self.room.clone(),
-                        widget,
-                        self.service_url.as_str(),
-                    )
-                    .await
-                    .context("publish MatrixRTC membership via widget api")?;
+                    widget
+                        .publish_membership(self.service_url.as_str())
+                        .await
+                        .context("publish MatrixRTC membership via widget api")?;
                 } else {
-                    send_hangup_via_widget(widget, self.shutdown_membership_state_key.as_ref())
+                    widget
+                        .send_hangup()
                         .await
                         .context("send shutdown membership via widget api")?;
                 }
@@ -482,7 +449,6 @@ fn retry_attempts_from_env(name: &str, default: usize) -> usize {
 fn retry_seconds_from_env(name: &str, default: u64) -> u64 {
     optional_env(name).and_then(|value| value.parse::<u64>().ok()).unwrap_or(default)
 }
-
 
 fn via_servers_from_env() -> anyhow::Result<Vec<OwnedServerName>> {
     let value = match env::var("VIA_SERVERS") {
