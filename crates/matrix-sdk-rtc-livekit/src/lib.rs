@@ -285,9 +285,9 @@ where
     let connection_details =
         resolve_connection_details(client, room, sfu_get_url, service_url_override, static_token)
             .await?;
+    let service_url = connection_details.authenticated_service_url()?;
     let token = connection_details.token;
     let token_len = token.len();
-    let service_url = connection_details.authenticated_service_url()?;
     let token_provider = EnvLiveKitTokenProvider::new(token);
     let connector = LiveKitSdkConnector::new(token_provider, room_options_provider);
 
