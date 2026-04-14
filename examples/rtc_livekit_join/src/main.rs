@@ -1,6 +1,5 @@
 #![recursion_limit = "256"]
 
-use std::sync::Arc;
 use std::{env, fs};
 
 use matrix_sdk::{
@@ -25,16 +24,11 @@ use matrix_sdk::widget::{
 use matrix_sdk_rtc_livekit::LiveKitError;
 use matrix_sdk_rtc_livekit::LiveKitResult;
 #[cfg(feature = "e2ee-per-participant")]
-use matrix_sdk_rtc_livekit::livekit::e2ee::key_provider::{
-    KeyDerivationFunction, KeyProvider, KeyProviderOptions,
-};
-#[cfg(feature = "e2ee-per-participant")]
-use matrix_sdk_rtc_livekit::livekit::id::ParticipantIdentity;
-#[cfg(feature = "e2ee-per-participant")]
 use matrix_sdk_rtc_livekit::per_participant::{
-    E2eeRoomOptionsProvider, PerParticipantE2eeContext, build_per_participant_e2ee,
-    per_participant_key_grace_period_from_env, register_e2ee_to_device_handler,
-    send_per_participant_keys, spawn_livekit_e2ee_event_resend,
+    PerParticipantE2eeContext, build_per_participant_e2ee,
+    build_per_participant_providers, per_participant_key_grace_period_from_env,
+    register_e2ee_to_device_handler, seed_local_participant_key, send_per_participant_keys,
+    spawn_livekit_e2ee_event_resend,
 };
 use matrix_sdk_rtc_livekit::{
     DefaultRoomOptionsProvider, LiveKitConnectionUpdate, LiveKitRoomOptionsProvider,
@@ -322,36 +316,9 @@ async fn run_rtc_livekit_join(client: Client) -> anyhow::Result<RtcLiveKitRuntim
     )
     .await?;
     #[cfg(feature = "e2ee-per-participant")]
-    if let Some(context) = e2ee_context.as_ref() {
-        if let (Some(user_id), Some(device_id)) = (client.user_id(), client.device_id()) {
-            let identity = ParticipantIdentity(format!("{user_id}:{device_id}"));
-            let key_set = context.key_provider.set_key(
-                &identity,
-                context.key_index,
-                context.local_key.clone(),
-            );
-            info!(
-                %identity,
-                key_index = context.key_index,
-                key_set,
-                "seeded local per-participant E2EE key_provider key before LiveKit connect"
-            );
-        }
-    }
+    seed_local_participant_key(&client, e2ee_context.as_ref());
     #[cfg(feature = "e2ee-per-participant")]
-    let e2ee_to_device_key_provider = if let Some(context) = e2ee_context.as_ref() {
-        Arc::clone(&context.key_provider)
-    } else {
-        warn!(
-            room_id = %room.room_id(),
-            "per-participant E2EE context unavailable; registering to-device handler with fallback key provider"
-        );
-        let mut fallback_options = KeyProviderOptions::default();
-        fallback_options.ratchet_window_size = 10;
-        fallback_options.key_ring_size = 256;
-        fallback_options.key_derivation_function = KeyDerivationFunction::HKDF;
-        Arc::new(KeyProvider::new(fallback_options))
-    };
+    let per_participant_providers = build_per_participant_providers(&room, e2ee_context.clone());
     info!(
         room_id = %room.room_id(),
         "registering per-participant E2EE to-device key handler (kept alive via EventHandlerDropGuard)"
@@ -359,14 +326,14 @@ async fn run_rtc_livekit_join(client: Client) -> anyhow::Result<RtcLiveKitRuntim
     let e2ee_to_device_guard = register_e2ee_to_device_handler(
         &client,
         room.room_id().to_owned(),
-        e2ee_to_device_key_provider,
+        per_participant_providers.to_device_key_provider,
     );
     #[cfg(feature = "e2ee-per-participant")]
     if let Some(context) = e2ee_context.as_ref() {
         spawn_periodic_e2ee_key_resend(room.clone(), context.clone());
     }
     #[cfg(feature = "e2ee-per-participant")]
-    let room_options_provider = E2eeRoomOptionsProvider { e2ee: e2ee_context.clone() };
+    let room_options_provider = per_participant_providers.room_options_provider;
     #[cfg(not(feature = "e2ee-per-participant"))]
     let room_options_provider = DefaultRoomOptionsProvider;
     #[cfg(not(feature = "e2ee-per-participant"))]

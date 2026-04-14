@@ -52,6 +52,54 @@ impl LiveKitRoomOptionsProvider for E2eeRoomOptionsProvider {
     }
 }
 
+/// Precomputed per-participant E2EE providers used by the example runtime.
+pub struct PerParticipantE2eeProviders {
+    pub room_options_provider: E2eeRoomOptionsProvider,
+    pub to_device_key_provider: Arc<KeyProvider>,
+}
+
+/// Build the to-device key provider and room options provider from an optional E2EE context.
+pub fn build_per_participant_providers(
+    room: &Room,
+    e2ee: Option<PerParticipantE2eeContext>,
+) -> PerParticipantE2eeProviders {
+    let to_device_key_provider = if let Some(context) = e2ee.as_ref() {
+        Arc::clone(&context.key_provider)
+    } else {
+        warn!(
+            room_id = %room.room_id(),
+            "per-participant E2EE context unavailable; registering to-device handler with fallback key provider"
+        );
+        let mut fallback_options = KeyProviderOptions::default();
+        fallback_options.ratchet_window_size = 10;
+        fallback_options.key_ring_size = 256;
+        fallback_options.key_derivation_function = KeyDerivationFunction::HKDF;
+        Arc::new(KeyProvider::new(fallback_options))
+    };
+
+    let room_options_provider = E2eeRoomOptionsProvider { e2ee };
+
+    PerParticipantE2eeProviders { room_options_provider, to_device_key_provider }
+}
+
+/// Seed the local participant key into the key provider when user/device IDs are available.
+pub fn seed_local_participant_key(client: &Client, e2ee: Option<&PerParticipantE2eeContext>) {
+    if let Some(context) = e2ee
+        && let (Some(user_id), Some(device_id)) = (client.user_id(), client.device_id())
+    {
+        let identity = ParticipantIdentity(format!("{user_id}:{device_id}"));
+        let key_set = context
+            .key_provider
+            .set_key(&identity, context.key_index, context.local_key.clone());
+        info!(
+            %identity,
+            key_index = context.key_index,
+            key_set,
+            "seeded local per-participant E2EE key_provider key before LiveKit connect"
+        );
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum PerParticipantE2eeError {
     #[error("missing device id for per-participant E2EE")]
