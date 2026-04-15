@@ -3,11 +3,9 @@
 use matrix_sdk::{
     Client, RoomState,
     config::SyncSettings,
-    event_handler::EventHandlerDropGuard,
     room::Room,
     ruma::{OwnedServerName, RoomId, RoomOrAliasId, ServerName},
 };
-use std::borrow::ToOwned;
 use std::sync::Arc;
 use std::time::Duration;
 use std::{env, fs};
@@ -27,7 +25,7 @@ use matrix_sdk_rtc_livekit::per_participant::{
     PerParticipantE2eeContext, handle_per_participant_joined, prepare_per_participant_e2ee,
 };
 use matrix_sdk_rtc_livekit::{
-    LiveKitConnectionUpdate, LiveKitRoomOptionsProvider, Room as LivekitRoom,
+    LiveKitRoomOptionsProvider, Room as LivekitRoom,
     handle_joined_left_connection_update, prepare_livekit_sdk_connector,
     run_livekit_driver_with_handler,
 };
@@ -46,6 +44,7 @@ fn v4l2_config_from_env() -> anyhow::Result<()> {
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
 
+    // collecting matrix specific config variables
     let homeserver_url = required_env("HOMESERVER_URL")?;
     let username = required_env("MATRIX_USERNAME")?;
     let password = required_env("MATRIX_PASSWORD")?;
@@ -54,7 +53,7 @@ async fn main() -> anyhow::Result<()> {
     let store_dir = env::current_dir().context("read current directory")?.join("matrix-sdk-store");
     prepare_sqlite_store_dir(&store_dir)?;
 
-    // our actual runner
+    // deriving matrix client from succesful login
     let client = login(
         &homeserver_url,
         &username,
@@ -71,8 +70,6 @@ async fn main() -> anyhow::Result<()> {
         .open_secret_store(secret_key.as_deref().unwrap())
         .await?;
     import_known_secrets(&client, secret_store).await?;
-
-    println!("before webserver setup");
 
     let sync_handle = tokio::spawn({
         let client = client.clone();
@@ -195,17 +192,13 @@ fn prepare_sqlite_store_dir(store_dir: &std::path::Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+// sync is necessary for call to collect other participants encryption_keys events
 async fn sync(client: Client) -> anyhow::Result<()> {
-    // An initial sync to set up state and so our bot doesn't respond to old
-    // messages. If the `StateStore` finds saved state in the location given the
-    // initial sync will be skipped in favor of loading state from the store
     let sync_token = client.sync_once(SyncSettings::default()).await.unwrap().next_batch;
 
     // since we called `sync_once` before we entered our sync loop we must pass
     // that sync token to `sync`
     let settings = SyncSettings::default().token(sync_token);
-    // this keeps state from the server streaming in to the bot via the
-    // EventHandler trait
     client.sync(settings).await?; // this essentially loops until we kill the bot
 
     Ok(())
@@ -247,7 +240,6 @@ async fn run_rtc_livekit_join(client: Client) -> anyhow::Result<RtcLiveKitRuntim
             .await
             .context("join room")?,
     };
-    let room_for_activation = room.clone();
     let element_call_url = optional_env("ELEMENT_CALL_URL");
     #[cfg(feature = "experimental-widgets")]
     let widget = if let Some(element_call_url) = element_call_url {
@@ -302,9 +294,6 @@ async fn run_rtc_livekit_join(client: Client) -> anyhow::Result<RtcLiveKitRuntim
     .context("prepare LiveKit SDK connector")?;
     let service_url = prepared_livekit.service_url.clone();
     let token_len = prepared_livekit.token_len;
-
-    #[cfg(feature = "e2ee-per-participant")]
-    let e2ee_to_device_guard = prepared_e2ee.to_device_guard;
     #[cfg(feature = "e2ee-per-participant")]
     let e2ee_context_for_driver = prepared_e2ee.context;
 
@@ -365,26 +354,21 @@ async fn run_rtc_livekit_join(client: Client) -> anyhow::Result<RtcLiveKitRuntim
     });
 
     Ok(RtcLiveKitRuntime {
-        room: room_for_activation,
         service_url,
         #[cfg(feature = "experimental-widgets")]
         widget,
-        #[cfg(feature = "e2ee-per-participant")]
-        e2ee_to_device_guard,
         driver_handle,
     })
 }
 
 struct RtcLiveKitRuntime {
-    room: Room,
     service_url: String,
     #[cfg(feature = "experimental-widgets")]
     widget: Option<LiveKitElementCallWidget>,
-    #[cfg(feature = "e2ee-per-participant")]
-    e2ee_to_device_guard: EventHandlerDropGuard,
     driver_handle: tokio::task::JoinHandle<anyhow::Result<DriverState>>,
 }
 
+// toggle between call participating by publishing membership event or send hangup event
 impl RtcLiveKitRuntime {
     async fn set_call_active(&self, active: bool) -> anyhow::Result<()> {
         #[cfg(feature = "experimental-widgets")]
