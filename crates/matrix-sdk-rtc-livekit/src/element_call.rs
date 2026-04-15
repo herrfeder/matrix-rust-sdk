@@ -30,7 +30,6 @@ pub async fn element_call_encryption_for_room(
     Ok(EncryptionSystem::Unencrypted)
 }
 
-
 /// Start Element Call with sensible defaults for a MatrixRTC join flow.
 pub async fn start_element_call_widget_for_room(
     room: MatrixRoom,

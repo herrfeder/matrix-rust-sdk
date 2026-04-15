@@ -450,12 +450,35 @@ impl<T, O> LiveKitSdkConnector<T, O> {
     }
 }
 
+/// Stream of events received from a joined LiveKit room.
+pub type LiveKitRoomEvents = tokio::sync::mpsc::UnboundedReceiver<RoomEvent>;
+
 /// Update event emitted by [`update_connection`].
 #[derive(Debug)]
 pub enum LiveKitConnectionUpdate {
-    Joined { room: Arc<Room>, events: Option<tokio::sync::mpsc::UnboundedReceiver<RoomEvent>> },
+    Joined { room: Arc<Room>, events: Option<LiveKitRoomEvents> },
     Left,
     Unchanged,
+}
+
+/// Handle a connection update by delegating joined/left transitions.
+pub async fn handle_joined_left_connection_update<S, J, L, JFut, LFut>(
+    state: S,
+    update: LiveKitConnectionUpdate,
+    on_joined: &J,
+    on_left: &L,
+) -> LiveKitResult<S>
+where
+    J: Fn(S, Arc<Room>, Option<LiveKitRoomEvents>) -> JFut,
+    L: Fn(S) -> LFut,
+    JFut: Future<Output = LiveKitResult<S>>,
+    LFut: Future<Output = LiveKitResult<S>>,
+{
+    match update {
+        LiveKitConnectionUpdate::Joined { room, events } => on_joined(state, room, events).await,
+        LiveKitConnectionUpdate::Left => on_left(state).await,
+        LiveKitConnectionUpdate::Unchanged => Ok(state),
+    }
 }
 
 /// Handle a connection update and return the next driver state.

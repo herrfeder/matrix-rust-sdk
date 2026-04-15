@@ -24,12 +24,11 @@ use matrix_sdk_rtc_livekit::element_call::{
 };
 #[cfg(feature = "e2ee-per-participant")]
 use matrix_sdk_rtc_livekit::per_participant::{
-    PerParticipantE2eeContext, per_participant_key_grace_period_from_env,
-    prepare_per_participant_e2ee, send_per_participant_keys, spawn_livekit_e2ee_event_resend,
+    PerParticipantE2eeContext, handle_per_participant_joined, prepare_per_participant_e2ee,
 };
 use matrix_sdk_rtc_livekit::{
     LiveKitConnectionUpdate, LiveKitRoomOptionsProvider, Room as LivekitRoom,
-    handle_connection_update as handle_livekit_connection_update, prepare_livekit_sdk_connector,
+    handle_joined_left_connection_update, prepare_livekit_sdk_connector,
     run_livekit_driver_with_handler,
 };
 use tracing::{info, warn};
@@ -331,8 +330,34 @@ async fn run_rtc_livekit_join(client: Client) -> anyhow::Result<RtcLiveKitRuntim
                 e2ee_context_for_driver,
             ),
             |state, update| async move {
-                handle_livekit_connection_update(state, update, &handle_driver_connection_update)
-                    .await
+                handle_joined_left_connection_update(
+                    state,
+                    update,
+                    &|mut state, room_handle, events| async move {
+                        info!(room_name = %room_handle.name(), "LiveKit room connected");
+                        #[cfg(feature = "e2ee-per-participant")]
+                        let livekit_events = events;
+                        #[cfg(not(feature = "e2ee-per-participant"))]
+                        let _ = events;
+                        #[cfg(feature = "e2ee-per-participant")]
+                        handle_per_participant_joined(
+                            &state.room,
+                            &room_handle,
+                            livekit_events,
+                            state.e2ee_context.as_ref(),
+                            "PER_PARTICIPANT_KEY_GRACE_PERIOD_MS",
+                            300,
+                        )
+                        .await;
+                        set_video_stream_enabled(&mut state, Some(room_handle), true).await?;
+                        Ok(state)
+                    },
+                    &|mut state| async move {
+                        set_video_stream_enabled(&mut state, None, false).await?;
+                        Ok(state)
+                    },
+                )
+                .await
             },
         )
         .await
@@ -500,72 +525,4 @@ async fn set_video_stream_enabled(
     }
 
     Ok(())
-}
-
-async fn handle_driver_connection_update(
-    mut state: DriverState,
-    update: LiveKitConnectionUpdate,
-) -> LiveKitResult<DriverState> {
-    match update {
-        LiveKitConnectionUpdate::Joined { room: room_handle, events } => {
-            info!(room_name = %room_handle.name(), "LiveKit room connected");
-            #[cfg(feature = "e2ee-per-participant")]
-            let livekit_events = events;
-            #[cfg(not(feature = "e2ee-per-participant"))]
-            let _ = events;
-            #[cfg(feature = "e2ee-per-participant")]
-            if let Some(context) = state.e2ee_context.as_ref() {
-                let identity = room_handle.local_participant().identity();
-                let key_set = context.key_provider.set_key(
-                    &identity,
-                    context.key_index,
-                    context.local_key.clone(),
-                );
-                room_handle.e2ee_manager().set_enabled(true);
-                info!(
-                    %identity,
-                    key_index = context.key_index,
-                    key_set,
-                    "enabled per-participant E2EE for local participant"
-                );
-
-                if let Err(err) = send_per_participant_keys(
-                    &state.room,
-                    context.key_index,
-                    &context.local_key,
-                    None,
-                )
-                .await
-                {
-                    info!(
-                        ?err,
-                        "failed to send per-participant E2EE keys immediately after room connect"
-                    );
-                }
-
-                let key_grace_period = per_participant_key_grace_period_from_env(
-                    "PER_PARTICIPANT_KEY_GRACE_PERIOD_MS",
-                    300,
-                );
-                if !key_grace_period.is_zero() {
-                    info!(
-                        key_grace_period_ms = key_grace_period.as_millis(),
-                        "waiting for per-participant E2EE key grace period before publishing media"
-                    );
-                    tokio::time::sleep(key_grace_period).await;
-                }
-
-                if let Some(events) = livekit_events {
-                    spawn_livekit_e2ee_event_resend(state.room.clone(), events, context.clone());
-                }
-            }
-            set_video_stream_enabled(&mut state, Some(room_handle), true).await?;
-        }
-        LiveKitConnectionUpdate::Left => {
-            set_video_stream_enabled(&mut state, None, false).await?;
-        }
-        LiveKitConnectionUpdate::Unchanged => {}
-    }
-
-    Ok(state)
 }

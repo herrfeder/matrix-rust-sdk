@@ -88,9 +88,8 @@ pub fn seed_local_participant_key(client: &Client, e2ee: Option<&PerParticipantE
         && let (Some(user_id), Some(device_id)) = (client.user_id(), client.device_id())
     {
         let identity = ParticipantIdentity(format!("{user_id}:{device_id}"));
-        let key_set = context
-            .key_provider
-            .set_key(&identity, context.key_index, context.local_key.clone());
+        let key_set =
+            context.key_provider.set_key(&identity, context.key_index, context.local_key.clone());
         info!(
             %identity,
             key_index = context.key_index,
@@ -278,6 +277,53 @@ pub async fn send_per_participant_keys(
     Ok(())
 }
 
+/// Apply per-participant E2EE setup immediately after joining a LiveKit room.
+pub async fn handle_per_participant_joined(
+    room: &Room,
+    room_handle: &Arc<livekit::Room>,
+    events: Option<crate::LiveKitRoomEvents>,
+    context: Option<&PerParticipantE2eeContext>,
+    key_grace_period_var: &str,
+    key_grace_period_default_ms: u64,
+) {
+    let Some(context) = context else {
+        return;
+    };
+
+    let identity = room_handle.local_participant().identity();
+    let key_set =
+        context.key_provider.set_key(&identity, context.key_index, context.local_key.clone());
+    room_handle.e2ee_manager().set_enabled(true);
+    info!(
+        %identity,
+        key_index = context.key_index,
+        key_set,
+        "enabled per-participant E2EE for local participant"
+    );
+
+    if let Err(err) =
+        send_per_participant_keys(room, context.key_index, &context.local_key, None).await
+    {
+        info!(?err, "failed to send per-participant E2EE keys immediately after room connect");
+    }
+
+    let key_grace_period = per_participant_key_grace_period_from_env(
+        key_grace_period_var,
+        key_grace_period_default_ms,
+    );
+    if !key_grace_period.is_zero() {
+        info!(
+            key_grace_period_ms = key_grace_period.as_millis(),
+            "waiting for per-participant E2EE key grace period before publishing media"
+        );
+        tokio::time::sleep(key_grace_period).await;
+    }
+
+    if let Some(events) = events {
+        spawn_livekit_e2ee_event_resend(room.clone(), events, context.clone());
+    }
+}
+
 /// Register a to-device handler that applies received per-participant keys.
 pub fn register_e2ee_to_device_handler(
     client: &Client,
@@ -294,33 +340,32 @@ pub fn register_e2ee_to_device_handler(
                 .flatten()
                 .unwrap_or_else(|| "<missing>".to_owned());
 
-            let event_map =
-                match raw.deserialize_as::<serde_json::Map<String, serde_json::Value>>()
-                {
-                    Ok(event_map) => event_map,
-                    Err(err) => {
-                        warn!(
-                            event_type = %observed_event_type,
-                            ?err,
-                            "failed to deserialize raw to-device event into JSON map"
-                        );
-                        return;
-                    }
-                };
-            let event_value = serde_json::Value::Object(event_map);
-            let event = match serde_json::from_value::<IncomingKeyToDeviceEvent>(event_value.clone())
+            let event_map = match raw.deserialize_as::<serde_json::Map<String, serde_json::Value>>()
             {
-                Ok(event) => event,
+                Ok(event_map) => event_map,
                 Err(err) => {
                     warn!(
                         event_type = %observed_event_type,
                         ?err,
-                        raw_event = ?event_value,
-                        "failed to parse to-device event as IncomingKeyToDeviceEvent"
+                        "failed to deserialize raw to-device event into JSON map"
                     );
                     return;
                 }
             };
+            let event_value = serde_json::Value::Object(event_map);
+            let event =
+                match serde_json::from_value::<IncomingKeyToDeviceEvent>(event_value.clone()) {
+                    Ok(event) => event,
+                    Err(err) => {
+                        warn!(
+                            event_type = %observed_event_type,
+                            ?err,
+                            raw_event = ?event_value,
+                            "failed to parse to-device event as IncomingKeyToDeviceEvent"
+                        );
+                        return;
+                    }
+                };
 
             if event.event_type != "io.element.call.encryption_keys" {
                 return;
