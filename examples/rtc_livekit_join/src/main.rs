@@ -1,40 +1,34 @@
 #![recursion_limit = "256"]
 
-use std::{env, fs};
-use std::sync::Arc;
 use matrix_sdk::{
     Client, RoomState,
     config::SyncSettings,
-    event_handler::EventHandlerDropGuard,
     room::Room,
     ruma::{OwnedServerName, RoomId, RoomOrAliasId, ServerName},
 };
-use std::borrow::ToOwned;
+use std::sync::Arc;
 use std::time::Duration;
+use std::{env, fs};
 
 use matrix_sdk::encryption::secret_storage::SecretStore;
 
 use anyhow::{Context, anyhow};
-#[cfg(feature = "experimental-widgets")]
-use matrix_sdk::widget::{
-    ClientProperties, ElementCallWidget, ElementCallWidgetOptions, EncryptionSystem, Intent,
-    publish_call_membership_via_widget, send_hangup_via_widget, start_element_call_widget,
-};
 #[cfg(all(feature = "v4l2", target_os = "linux"))]
 use matrix_sdk_rtc_livekit::LiveKitError;
 use matrix_sdk_rtc_livekit::LiveKitResult;
+#[cfg(feature = "experimental-widgets")]
+use matrix_sdk_rtc_livekit::element_call::{
+    LiveKitElementCallWidget, start_element_call_widget_for_room,
+};
 #[cfg(feature = "e2ee-per-participant")]
 use matrix_sdk_rtc_livekit::per_participant::{
-    PerParticipantE2eeContext, per_participant_key_grace_period_from_env,
-    prepare_per_participant_e2ee, send_per_participant_keys, spawn_livekit_e2ee_event_resend,
+    PerParticipantE2eeContext, handle_per_participant_joined, prepare_per_participant_e2ee,
 };
 use matrix_sdk_rtc_livekit::{
-    LiveKitConnectionUpdate, LiveKitRoomOptionsProvider,
-    Room as LivekitRoom, handle_connection_update as handle_livekit_connection_update,
-    prepare_livekit_sdk_connector, run_livekit_driver_with_handler,
+    LiveKitRoomOptionsProvider, Room as LivekitRoom,
+    handle_joined_left_connection_update, prepare_livekit_sdk_connector,
+    run_livekit_driver_with_handler,
 };
-#[cfg(feature = "experimental-widgets")]
-use ruma::events::call::member::CallMemberStateKey;
 use tracing::{info, warn};
 #[cfg(all(feature = "v4l2", target_os = "linux"))]
 mod videosource;
@@ -50,6 +44,7 @@ fn v4l2_config_from_env() -> anyhow::Result<()> {
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
 
+    // collecting matrix specific config variables
     let homeserver_url = required_env("HOMESERVER_URL")?;
     let username = required_env("MATRIX_USERNAME")?;
     let password = required_env("MATRIX_PASSWORD")?;
@@ -58,7 +53,7 @@ async fn main() -> anyhow::Result<()> {
     let store_dir = env::current_dir().context("read current directory")?.join("matrix-sdk-store");
     prepare_sqlite_store_dir(&store_dir)?;
 
-    // our actual runner
+    // deriving matrix client from succesful login
     let client = login(
         &homeserver_url,
         &username,
@@ -75,8 +70,6 @@ async fn main() -> anyhow::Result<()> {
         .open_secret_store(secret_key.as_deref().unwrap())
         .await?;
     import_known_secrets(&client, secret_store).await?;
-
-    println!("before webserver setup");
 
     let sync_handle = tokio::spawn({
         let client = client.clone();
@@ -199,17 +192,13 @@ fn prepare_sqlite_store_dir(store_dir: &std::path::Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+// sync is necessary for call to collect other participants encryption_keys events
 async fn sync(client: Client) -> anyhow::Result<()> {
-    // An initial sync to set up state and so our bot doesn't respond to old
-    // messages. If the `StateStore` finds saved state in the location given the
-    // initial sync will be skipped in favor of loading state from the store
     let sync_token = client.sync_once(SyncSettings::default()).await.unwrap().next_batch;
 
     // since we called `sync_once` before we entered our sync loop we must pass
     // that sync token to `sync`
     let settings = SyncSettings::default().token(sync_token);
-    // this keeps state from the server streaming in to the bot via the
-    // EventHandler trait
     client.sync(settings).await?; // this essentially loops until we kill the bot
 
     Ok(())
@@ -251,50 +240,16 @@ async fn run_rtc_livekit_join(client: Client) -> anyhow::Result<RtcLiveKitRuntim
             .await
             .context("join room")?,
     };
-    let room_for_activation = room.clone();
-    let element_call_url =
-        optional_env("ELEMENT_CALL_URL").or_else(|| optional_env("ELEMENT_CALL_WIDGET"));
+    let element_call_url = optional_env("ELEMENT_CALL_URL");
     #[cfg(feature = "experimental-widgets")]
     let widget = if let Some(element_call_url) = element_call_url {
         info!(%element_call_url, "Element Call widget URL set; starting widget bridge");
 
-        let encryption_state = room
-            .latest_encryption_state()
-            .await
-            .context("load room encryption state for element call")?;
-        let encryption = if encryption_state.is_encrypted() {
-            info!("room is encrypted; Element Call will be configured for E2EE");
-            #[cfg(feature = "e2ee-per-participant")]
-            {
-                EncryptionSystem::PerParticipantKeys
-            }
-            #[cfg(not(feature = "e2ee-per-participant"))]
-            {
-                info!("room is encrypted but per-participant E2EE is disabled at compile time");
-                EncryptionSystem::Unencrypted
-            }
-        } else {
-            info!("room is not encrypted; Element Call will be configured unencrypted");
-            EncryptionSystem::Unencrypted
-        };
-
-        let options = ElementCallWidgetOptions {
-            widget_id: optional_env("ELEMENT_CALL_WIDGET_ID")
-                .unwrap_or_else(|| "element-call".to_owned()),
-            parent_url: optional_env("ELEMENT_CALL_PARENT_URL"),
-            encryption,
-            intent: Intent::JoinExisting,
-            client_properties: ClientProperties::new("matrix-sdk-rtc-livekit-join", None, None),
-        };
-
         Some(
-            start_element_call_widget(room.clone(), element_call_url, options)
+            start_element_call_widget_for_room(room.clone(), element_call_url)
                 .await
                 .context("start element call widget")?,
         )
-    } else if optional_env("ELEMENT_CALL_WIDGET_ID").is_some() {
-        info!("ELEMENT_CALL_WIDGET_ID set but no Element Call URL provided");
-        None
     } else {
         None
     };
@@ -339,22 +294,9 @@ async fn run_rtc_livekit_join(client: Client) -> anyhow::Result<RtcLiveKitRuntim
     .context("prepare LiveKit SDK connector")?;
     let service_url = prepared_livekit.service_url.clone();
     let token_len = prepared_livekit.token_len;
-
-    #[cfg(feature = "e2ee-per-participant")]
-    let e2ee_to_device_guard = prepared_e2ee.to_device_guard;
     #[cfg(feature = "e2ee-per-participant")]
     let e2ee_context_for_driver = prepared_e2ee.context;
 
-    #[cfg(feature = "experimental-widgets")]
-    let shutdown_membership_state_key = if widget.is_some() {
-        let own_user_id =
-            client.user_id().context("missing user id for widget shutdown event")?.to_owned();
-        let own_device_id =
-            client.device_id().context("missing device id for widget shutdown event")?.to_owned();
-        Some(CallMemberStateKey::new(own_user_id, Some(own_device_id.to_string()), true))
-    } else {
-        None
-    };
     info!(
         room_id = ?room.room_id(),
         service_url = %service_url,
@@ -377,8 +319,34 @@ async fn run_rtc_livekit_join(client: Client) -> anyhow::Result<RtcLiveKitRuntim
                 e2ee_context_for_driver,
             ),
             |state, update| async move {
-                handle_livekit_connection_update(state, update, &handle_driver_connection_update)
-                    .await
+                handle_joined_left_connection_update(
+                    state,
+                    update,
+                    &|mut state, room_handle, events| async move {
+                        info!(room_name = %room_handle.name(), "LiveKit room connected");
+                        #[cfg(feature = "e2ee-per-participant")]
+                        let livekit_events = events;
+                        #[cfg(not(feature = "e2ee-per-participant"))]
+                        let _ = events;
+                        #[cfg(feature = "e2ee-per-participant")]
+                        handle_per_participant_joined(
+                            &state.room,
+                            &room_handle,
+                            livekit_events,
+                            state.e2ee_context.as_ref(),
+                            "PER_PARTICIPANT_KEY_GRACE_PERIOD_MS",
+                            300,
+                        )
+                        .await;
+                        set_video_stream_enabled(&mut state, Some(room_handle), true).await?;
+                        Ok(state)
+                    },
+                    &|mut state| async move {
+                        set_video_stream_enabled(&mut state, None, false).await?;
+                        Ok(state)
+                    },
+                )
+                .await
             },
         )
         .await
@@ -386,45 +354,34 @@ async fn run_rtc_livekit_join(client: Client) -> anyhow::Result<RtcLiveKitRuntim
     });
 
     Ok(RtcLiveKitRuntime {
-        room: room_for_activation,
         service_url,
         #[cfg(feature = "experimental-widgets")]
         widget,
-        #[cfg(feature = "experimental-widgets")]
-        shutdown_membership_state_key,
-        #[cfg(feature = "e2ee-per-participant")]
-        e2ee_to_device_guard,
         driver_handle,
     })
 }
 
 struct RtcLiveKitRuntime {
-    room: Room,
     service_url: String,
     #[cfg(feature = "experimental-widgets")]
-    widget: Option<ElementCallWidget>,
-    #[cfg(feature = "experimental-widgets")]
-    shutdown_membership_state_key: Option<CallMemberStateKey>,
-    #[cfg(feature = "e2ee-per-participant")]
-    e2ee_to_device_guard: EventHandlerDropGuard,
+    widget: Option<LiveKitElementCallWidget>,
     driver_handle: tokio::task::JoinHandle<anyhow::Result<DriverState>>,
 }
 
+// toggle between call participating by publishing membership event or send hangup event
 impl RtcLiveKitRuntime {
     async fn set_call_active(&self, active: bool) -> anyhow::Result<()> {
         #[cfg(feature = "experimental-widgets")]
         {
             if let Some(widget) = self.widget.as_ref() {
                 if active {
-                    publish_call_membership_via_widget(
-                        self.room.clone(),
-                        widget,
-                        self.service_url.as_str(),
-                    )
-                    .await
-                    .context("publish MatrixRTC membership via widget api")?;
+                    widget
+                        .publish_membership(self.service_url.as_str())
+                        .await
+                        .context("publish MatrixRTC membership via widget api")?;
                 } else {
-                    send_hangup_via_widget(widget, self.shutdown_membership_state_key.as_ref())
+                    widget
+                        .send_hangup()
                         .await
                         .context("send shutdown membership via widget api")?;
                 }
@@ -482,7 +439,6 @@ fn retry_attempts_from_env(name: &str, default: usize) -> usize {
 fn retry_seconds_from_env(name: &str, default: u64) -> u64 {
     optional_env(name).and_then(|value| value.parse::<u64>().ok()).unwrap_or(default)
 }
-
 
 fn via_servers_from_env() -> anyhow::Result<Vec<OwnedServerName>> {
     let value = match env::var("VIA_SERVERS") {
@@ -553,72 +509,4 @@ async fn set_video_stream_enabled(
     }
 
     Ok(())
-}
-
-async fn handle_driver_connection_update(
-    mut state: DriverState,
-    update: LiveKitConnectionUpdate,
-) -> LiveKitResult<DriverState> {
-    match update {
-        LiveKitConnectionUpdate::Joined { room: room_handle, events } => {
-            info!(room_name = %room_handle.name(), "LiveKit room connected");
-            #[cfg(feature = "e2ee-per-participant")]
-            let livekit_events = events;
-            #[cfg(not(feature = "e2ee-per-participant"))]
-            let _ = events;
-            #[cfg(feature = "e2ee-per-participant")]
-            if let Some(context) = state.e2ee_context.as_ref() {
-                let identity = room_handle.local_participant().identity();
-                let key_set = context.key_provider.set_key(
-                    &identity,
-                    context.key_index,
-                    context.local_key.clone(),
-                );
-                room_handle.e2ee_manager().set_enabled(true);
-                info!(
-                    %identity,
-                    key_index = context.key_index,
-                    key_set,
-                    "enabled per-participant E2EE for local participant"
-                );
-
-                if let Err(err) = send_per_participant_keys(
-                    &state.room,
-                    context.key_index,
-                    &context.local_key,
-                    None,
-                )
-                .await
-                {
-                    info!(
-                        ?err,
-                        "failed to send per-participant E2EE keys immediately after room connect"
-                    );
-                }
-
-                let key_grace_period = per_participant_key_grace_period_from_env(
-                    "PER_PARTICIPANT_KEY_GRACE_PERIOD_MS",
-                    300,
-                );
-                if !key_grace_period.is_zero() {
-                    info!(
-                        key_grace_period_ms = key_grace_period.as_millis(),
-                        "waiting for per-participant E2EE key grace period before publishing media"
-                    );
-                    tokio::time::sleep(key_grace_period).await;
-                }
-
-                if let Some(events) = livekit_events {
-                    spawn_livekit_e2ee_event_resend(state.room.clone(), events, context.clone());
-                }
-            }
-            set_video_stream_enabled(&mut state, Some(room_handle), true).await?;
-        }
-        LiveKitConnectionUpdate::Left => {
-            set_video_stream_enabled(&mut state, None, false).await?;
-        }
-        LiveKitConnectionUpdate::Unchanged => {}
-    }
-
-    Ok(state)
 }

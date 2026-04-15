@@ -1,6 +1,6 @@
 //! LiveKit SDK integration for MatrixRTC room calls.
 
-use std::{future::Future, sync::Arc};
+use std::{error::Error, future::Future, sync::Arc};
 
 use async_trait::async_trait;
 use matrix_sdk::{Client, HttpError, Room as MatrixRoom};
@@ -12,6 +12,8 @@ use ruma::{
 use serde_json::Value as JsonValue;
 use thiserror::Error;
 
+#[cfg(feature = "experimental-widgets")]
+pub mod element_call;
 #[cfg(feature = "crypto")]
 pub mod per_participant;
 
@@ -37,16 +39,32 @@ pub enum LiveKitError {
 
     /// The LiveKit connector failed.
     #[error("livekit connector error: {0}")]
-    Connector(Box<dyn std::error::Error + Send + Sync>),
+    Connector(Box<dyn Error + Send + Sync>),
+
+    /// Element Call widget integration failed.
+    #[cfg(feature = "experimental-widgets")]
+    #[error("element call widget error: {0}")]
+    Widget(Box<dyn Error + Send + Sync>),
 }
 
 impl LiveKitError {
     /// Wrap a connector-specific error.
     pub fn connector<E>(error: E) -> Self
     where
-        E: std::error::Error + Send + Sync + 'static,
+        E: Error + Send + Sync + 'static,
     {
         Self::Connector(Box::new(error))
+    }
+}
+
+#[cfg(feature = "experimental-widgets")]
+impl LiveKitError {
+    /// Wrap a widget-specific error.
+    pub fn widget<E>(error: E) -> Self
+    where
+        E: Error + Send + Sync + 'static,
+    {
+        Self::Widget(Box::new(error))
     }
 }
 
@@ -432,12 +450,35 @@ impl<T, O> LiveKitSdkConnector<T, O> {
     }
 }
 
+/// Stream of events received from a joined LiveKit room.
+pub type LiveKitRoomEvents = tokio::sync::mpsc::UnboundedReceiver<RoomEvent>;
+
 /// Update event emitted by [`update_connection`].
 #[derive(Debug)]
 pub enum LiveKitConnectionUpdate {
-    Joined { room: Arc<Room>, events: Option<tokio::sync::mpsc::UnboundedReceiver<RoomEvent>> },
+    Joined { room: Arc<Room>, events: Option<LiveKitRoomEvents> },
     Left,
     Unchanged,
+}
+
+/// Handle a connection update by delegating joined/left transitions.
+pub async fn handle_joined_left_connection_update<S, J, L, JFut, LFut>(
+    state: S,
+    update: LiveKitConnectionUpdate,
+    on_joined: &J,
+    on_left: &L,
+) -> LiveKitResult<S>
+where
+    J: Fn(S, Arc<Room>, Option<LiveKitRoomEvents>) -> JFut,
+    L: Fn(S) -> LFut,
+    JFut: Future<Output = LiveKitResult<S>>,
+    LFut: Future<Output = LiveKitResult<S>>,
+{
+    match update {
+        LiveKitConnectionUpdate::Joined { room, events } => on_joined(state, room, events).await,
+        LiveKitConnectionUpdate::Left => on_left(state).await,
+        LiveKitConnectionUpdate::Unchanged => Ok(state),
+    }
 }
 
 /// Handle a connection update and return the next driver state.
