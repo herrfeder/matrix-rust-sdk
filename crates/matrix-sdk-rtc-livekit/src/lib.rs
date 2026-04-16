@@ -578,6 +578,29 @@ where
     Ok(state)
 }
 
+/// Run the LiveKit room driver and delegate joined/left transitions to dedicated handlers.
+pub async fn run_livekit_driver_joined_left<T, O, S, J, L, JFut, LFut>(
+    room: matrix_sdk::Room,
+    connector: &LiveKitSdkConnector<T, O>,
+    service_url: &str,
+    state: S,
+    on_joined: J,
+    on_left: L,
+) -> LiveKitResult<S>
+where
+    T: LiveKitTokenProvider,
+    O: LiveKitRoomOptionsProvider,
+    J: Fn(S, Arc<Room>, Option<LiveKitRoomEvents>) -> JFut,
+    L: Fn(S) -> LFut,
+    JFut: Future<Output = LiveKitResult<S>>,
+    LFut: Future<Output = LiveKitResult<S>>,
+{
+    run_livekit_driver_with_handler(room, connector, service_url, state, |state, update| async {
+        handle_joined_left_connection_update(state, update, &on_joined, &on_left).await
+    })
+    .await
+}
+
 #[async_trait]
 impl<T, O> LiveKitConnector for LiveKitSdkConnector<T, O>
 where
