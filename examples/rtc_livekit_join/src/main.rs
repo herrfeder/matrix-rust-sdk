@@ -20,12 +20,9 @@ use matrix_sdk_rtc_livekit::element_call::{
 use matrix_sdk_rtc_livekit::per_participant::{
     handle_per_participant_joined, prepare_per_participant_e2ee, PerParticipantE2eeContext,
 };
-#[cfg(all(feature = "v4l2", target_os = "linux"))]
-use matrix_sdk_rtc_livekit::LiveKitError;
-use matrix_sdk_rtc_livekit::LiveKitResult;
 use matrix_sdk_rtc_livekit::{
     prepare_livekit_sdk_connector, run_livekit_driver_joined_left, LiveKitRoomOptionsProvider,
-    Room as LivekitRoom,
+    Room as LivekitRoom, LiveKitError, LiveKitResult,
 };
 use tracing::{info, warn};
 #[cfg(all(feature = "v4l2", target_os = "linux"))]
