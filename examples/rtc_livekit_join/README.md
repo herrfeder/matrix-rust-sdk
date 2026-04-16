@@ -15,7 +15,6 @@ HOMESERVER_URL=https://matrix.example.org \
 MATRIX_USERNAME=@alice:example.org \
 MATRIX_PASSWORD=secret \
 ROOM_ID=!roomid:example.org \
-VIA_SERVERS=example.org,otherserver.org \
 LIVEKIT_SFU_GET_URL=https://demo.call.bundesmessenger.info/sfu/get \
 LIVEKIT_SERVICE_URL=wss://livekit.example.org \
 LIVEKIT_TOKEN=your-token \
@@ -197,8 +196,7 @@ mutually exclusive.
 ### Room identifier
 
 `ROOM_ID` can be either a room id (`!roomid:example.org`) or a room alias
-(`#alias:example.org`). If you provide an alias, set `VIA_SERVERS` to a
-comma-separated list of server names to help the homeserver resolve the alias.
+(`#alias:example.org`).
 
 ### LiveKit service URL
 

@@ -4,7 +4,7 @@ use matrix_sdk::{
     Client, RoomState,
     config::SyncSettings,
     room::Room,
-    ruma::{OwnedServerName, RoomId, RoomOrAliasId, ServerName},
+    ruma::{RoomId, RoomOrAliasId},
 };
 use std::sync::Arc;
 use std::time::Duration;
@@ -229,14 +229,14 @@ async fn run_rtc_livekit_join(client: Client) -> anyhow::Result<RtcLiveKitRuntim
     let v4l2_config = v4l2_config_from_env().context("read V4L2 config")?;
 
     let room_id_or_alias = RoomOrAliasId::parse(room_id_or_alias).context("parse ROOM_ID")?;
-    let via_servers = via_servers_from_env().context("parse VIA_SERVERS")?;
     let room = match RoomId::parse(room_id_or_alias.as_str()) {
         Ok(room_id) => match client.get_room(&room_id) {
             Some(room) if room.state() == RoomState::Joined => room,
             _ => client.join_room_by_id(&room_id).await.context("join room")?,
         },
+        // We intentionally do not provide via servers from env in this example.
         Err(_) => client
-            .join_room_by_id_or_alias(&room_id_or_alias, &via_servers)
+            .join_room_by_id_or_alias(&room_id_or_alias, &[])
             .await
             .context("join room")?,
     };
@@ -438,21 +438,6 @@ fn retry_attempts_from_env(name: &str, default: usize) -> usize {
 
 fn retry_seconds_from_env(name: &str, default: u64) -> u64 {
     optional_env(name).and_then(|value| value.parse::<u64>().ok()).unwrap_or(default)
-}
-
-fn via_servers_from_env() -> anyhow::Result<Vec<OwnedServerName>> {
-    let value = match env::var("VIA_SERVERS") {
-        Ok(value) => value,
-        Err(env::VarError::NotPresent) => return Ok(Vec::new()),
-        Err(err) => return Err(err.into()),
-    };
-
-    value
-        .split(',')
-        .map(str::trim)
-        .filter(|entry| !entry.is_empty())
-        .map(|entry| ServerName::parse(entry).context("parse server name"))
-        .collect()
 }
 
 struct DriverState {
