@@ -14,7 +14,6 @@ use thiserror::Error;
 
 #[cfg(feature = "experimental-widgets")]
 pub mod element_call;
-#[cfg(feature = "crypto")]
 pub mod per_participant;
 
 pub use livekit;
