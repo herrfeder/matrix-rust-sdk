@@ -18,7 +18,7 @@ async-trait.workspace = true
 base64.workspace = true
 futures-util.workspace = true
 mime.workspace = true
-matrix-sdk = { path = "../../crates/matrix-sdk", default-features = false }
+matrix-sdk = { path = "../../crates/matrix-sdk", default-features = false, features = ["e2e-encryption", "experimental-send-custom-to-device"] }
 matrix-sdk-base = { path = "../../crates/matrix-sdk-base" }
 matrix-sdk-crypto = { path = "../../crates/matrix-sdk-crypto" }
 matrix-sdk-rtc-livekit = { path = "../../crates/matrix-sdk-rtc-livekit", default-features = false }
@@ -48,7 +48,5 @@ default = []
 rustls-tls = ["matrix-sdk/rustls-tls", "matrix-sdk-rtc-livekit/rustls-tls"]
 native-tls = ["matrix-sdk/native-tls", "matrix-sdk-rtc-livekit/native-tls"]
 v4l2 = ["dep:v4l"]
-e2e-encryption = ["matrix-sdk/e2e-encryption"]
-e2ee-per-participant = ["matrix-sdk-rtc-livekit/crypto", "matrix-sdk/experimental-send-custom-to-device"]
 experimental-widgets = ["matrix-sdk/experimental-widgets", "matrix-sdk-rtc-livekit/experimental-widgets"]
 sqlite = ["matrix-sdk/sqlite"]

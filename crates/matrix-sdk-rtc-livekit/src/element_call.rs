@@ -16,15 +16,7 @@ pub async fn element_call_encryption_for_room(
     let encryption_state = room.latest_encryption_state().await.map_err(LiveKitError::widget)?;
 
     if encryption_state.is_encrypted() {
-        #[cfg(feature = "crypto")]
-        {
-            return Ok(EncryptionSystem::PerParticipantKeys);
-        }
-
-        #[cfg(not(feature = "crypto"))]
-        {
-            return Ok(EncryptionSystem::Unencrypted);
-        }
+        return Ok(EncryptionSystem::PerParticipantKeys);
     }
 
     Ok(EncryptionSystem::Unencrypted)

@@ -4,7 +4,7 @@ use matrix_sdk::{
     Client, RoomState,
     config::SyncSettings,
     room::Room,
-    ruma::{OwnedServerName, RoomId, RoomOrAliasId, ServerName},
+    ruma::{RoomId, RoomOrAliasId},
 };
 use std::sync::Arc;
 use std::time::Duration;
@@ -20,14 +20,12 @@ use matrix_sdk_rtc_livekit::LiveKitResult;
 use matrix_sdk_rtc_livekit::element_call::{
     LiveKitElementCallWidget, start_element_call_widget_for_room,
 };
-#[cfg(feature = "e2ee-per-participant")]
 use matrix_sdk_rtc_livekit::per_participant::{
     PerParticipantE2eeContext, handle_per_participant_joined, prepare_per_participant_e2ee,
 };
 use matrix_sdk_rtc_livekit::{
-    LiveKitRoomOptionsProvider, Room as LivekitRoom,
-    handle_joined_left_connection_update, prepare_livekit_sdk_connector,
-    run_livekit_driver_with_handler,
+    LiveKitRoomOptionsProvider, Room as LivekitRoom, handle_joined_left_connection_update,
+    prepare_livekit_sdk_connector, run_livekit_driver_with_handler,
 };
 use tracing::{info, warn};
 #[cfg(all(feature = "v4l2", target_os = "linux"))]
@@ -229,16 +227,15 @@ async fn run_rtc_livekit_join(client: Client) -> anyhow::Result<RtcLiveKitRuntim
     let v4l2_config = v4l2_config_from_env().context("read V4L2 config")?;
 
     let room_id_or_alias = RoomOrAliasId::parse(room_id_or_alias).context("parse ROOM_ID")?;
-    let via_servers = via_servers_from_env().context("parse VIA_SERVERS")?;
     let room = match RoomId::parse(room_id_or_alias.as_str()) {
         Ok(room_id) => match client.get_room(&room_id) {
             Some(room) if room.state() == RoomState::Joined => room,
             _ => client.join_room_by_id(&room_id).await.context("join room")?,
         },
-        Err(_) => client
-            .join_room_by_id_or_alias(&room_id_or_alias, &via_servers)
-            .await
-            .context("join room")?,
+        // We intentionally do not provide via servers from env in this example.
+        Err(_) => {
+            client.join_room_by_id_or_alias(&room_id_or_alias, &[]).await.context("join room")?
+        }
     };
     let element_call_url = optional_env("ELEMENT_CALL_URL");
     #[cfg(feature = "experimental-widgets")]
@@ -258,7 +255,6 @@ async fn run_rtc_livekit_join(client: Client) -> anyhow::Result<RtcLiveKitRuntim
     let widget: Option<()> = None;
 
     let static_livekit_token = optional_env("LIVEKIT_TOKEN");
-    #[cfg(feature = "e2ee-per-participant")]
     let prepared_e2ee = prepare_per_participant_e2ee(
         &room,
         bool_env("PER_PARTICIPANT_FORCE_BACKUP_DOWNLOAD"),
@@ -267,14 +263,7 @@ async fn run_rtc_livekit_join(client: Client) -> anyhow::Result<RtcLiveKitRuntim
         retry_seconds_from_env("PER_PARTICIPANT_KEY_RESEND_SECS", 0),
     )
     .await?;
-    #[cfg(feature = "e2ee-per-participant")]
     let room_options_provider = prepared_e2ee.room_options_provider;
-    #[cfg(not(feature = "e2ee-per-participant"))]
-    let room_options_provider = DefaultRoomOptionsProvider;
-    #[cfg(not(feature = "e2ee-per-participant"))]
-    info!(
-        "`e2ee-per-participant` feature is disabled; this device will not send io.element.call.encryption_keys to-device messages"
-    );
     let resolved_room_options = room_options_provider.room_options();
     info!(
         room_options_provider_type = std::any::type_name_of_val(&room_options_provider),
@@ -294,7 +283,6 @@ async fn run_rtc_livekit_join(client: Client) -> anyhow::Result<RtcLiveKitRuntim
     .context("prepare LiveKit SDK connector")?;
     let service_url = prepared_livekit.service_url.clone();
     let token_len = prepared_livekit.token_len;
-    #[cfg(feature = "e2ee-per-participant")]
     let e2ee_context_for_driver = prepared_e2ee.context;
 
     info!(
@@ -315,7 +303,6 @@ async fn run_rtc_livekit_join(client: Client) -> anyhow::Result<RtcLiveKitRuntim
                 room,
                 #[cfg(all(feature = "v4l2", target_os = "linux"))]
                 v4l2_config,
-                #[cfg(feature = "e2ee-per-participant")]
                 e2ee_context_for_driver,
             ),
             |state, update| async move {
@@ -324,11 +311,7 @@ async fn run_rtc_livekit_join(client: Client) -> anyhow::Result<RtcLiveKitRuntim
                     update,
                     &|mut state, room_handle, events| async move {
                         info!(room_name = %room_handle.name(), "LiveKit room connected");
-                        #[cfg(feature = "e2ee-per-participant")]
                         let livekit_events = events;
-                        #[cfg(not(feature = "e2ee-per-participant"))]
-                        let _ = events;
-                        #[cfg(feature = "e2ee-per-participant")]
                         handle_per_participant_joined(
                             &state.room,
                             &room_handle,
@@ -440,35 +423,19 @@ fn retry_seconds_from_env(name: &str, default: u64) -> u64 {
     optional_env(name).and_then(|value| value.parse::<u64>().ok()).unwrap_or(default)
 }
 
-fn via_servers_from_env() -> anyhow::Result<Vec<OwnedServerName>> {
-    let value = match env::var("VIA_SERVERS") {
-        Ok(value) => value,
-        Err(env::VarError::NotPresent) => return Ok(Vec::new()),
-        Err(err) => return Err(err.into()),
-    };
-
-    value
-        .split(',')
-        .map(str::trim)
-        .filter(|entry| !entry.is_empty())
-        .map(|entry| ServerName::parse(entry).context("parse server name"))
-        .collect()
-}
-
 struct DriverState {
     room: Room,
     #[cfg(all(feature = "v4l2", target_os = "linux"))]
     v4l2_config: Option<V4l2Config>,
     #[cfg(all(feature = "v4l2", target_os = "linux"))]
     v4l2_publisher: Option<V4l2CameraPublisher>,
-    #[cfg(feature = "e2ee-per-participant")]
     e2ee_context: Option<PerParticipantE2eeContext>,
 }
 
 fn build_driver_state(
     room: Room,
     #[cfg(all(feature = "v4l2", target_os = "linux"))] v4l2_config: Option<V4l2Config>,
-    #[cfg(feature = "e2ee-per-participant")] e2ee_context: Option<PerParticipantE2eeContext>,
+    e2ee_context: Option<PerParticipantE2eeContext>,
 ) -> DriverState {
     DriverState {
         room,
@@ -476,7 +443,6 @@ fn build_driver_state(
         v4l2_config,
         #[cfg(all(feature = "v4l2", target_os = "linux"))]
         v4l2_publisher: None,
-        #[cfg(feature = "e2ee-per-participant")]
         e2ee_context,
     }
 }
