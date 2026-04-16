@@ -104,11 +104,10 @@ RUST_LOG=info \
 cargo run -p example-rtc-livekit-join --features v4l2
 ```
 
-To enable per-participant E2EE (MSC4268 key bundles), add the
-`e2ee-per-participant` feature:
+Per-participant E2EE (MSC4268 key bundles) is compiled in by default:
 
 ```bash
-cargo run -p example-rtc-livekit-join --features v4l2,e2ee-per-participant
+cargo run -p example-rtc-livekit-join --features v4l2
 ```
 
 Notes:

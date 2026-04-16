@@ -44,7 +44,7 @@ once_cell = "1.20.3"
 workspace = true
 
 [features]
-default = []
+default = ["e2e-encryption", "e2ee-per-participant"]
 rustls-tls = ["matrix-sdk/rustls-tls", "matrix-sdk-rtc-livekit/rustls-tls"]
 native-tls = ["matrix-sdk/native-tls", "matrix-sdk-rtc-livekit/native-tls"]
 v4l2 = ["dep:v4l"]
