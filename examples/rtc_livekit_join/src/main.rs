@@ -1,10 +1,10 @@
 #![recursion_limit = "256"]
 
 use matrix_sdk::{
-    Client, RoomState,
     config::SyncSettings,
     room::Room,
     ruma::{RoomId, RoomOrAliasId},
+    Client, RoomState,
 };
 use std::sync::Arc;
 use std::time::Duration;
@@ -12,26 +12,23 @@ use std::{env, fs};
 
 use matrix_sdk::encryption::secret_storage::SecretStore;
 
-use anyhow::{Context, anyhow};
-#[cfg(all(feature = "v4l2", target_os = "linux"))]
-use matrix_sdk_rtc_livekit::LiveKitError;
-use matrix_sdk_rtc_livekit::LiveKitResult;
+use anyhow::{anyhow, Context};
 #[cfg(feature = "experimental-widgets")]
 use matrix_sdk_rtc_livekit::element_call::{
-    LiveKitElementCallWidget, start_element_call_widget_for_room,
+    start_element_call_widget_for_room, LiveKitElementCallWidget,
 };
 use matrix_sdk_rtc_livekit::per_participant::{
-    PerParticipantE2eeContext, handle_per_participant_joined, prepare_per_participant_e2ee,
+    handle_per_participant_joined, prepare_per_participant_e2ee, PerParticipantE2eeContext,
 };
 use matrix_sdk_rtc_livekit::{
-    LiveKitRoomOptionsProvider, Room as LivekitRoom, handle_joined_left_connection_update,
-    prepare_livekit_sdk_connector, run_livekit_driver_with_handler,
+    prepare_livekit_sdk_connector, run_livekit_driver_joined_left, LiveKitRoomOptionsProvider,
+    Room as LivekitRoom, LiveKitError, LiveKitResult,
 };
 use tracing::{info, warn};
 #[cfg(all(feature = "v4l2", target_os = "linux"))]
 mod videosource;
 #[cfg(all(feature = "v4l2", target_os = "linux"))]
-use videosource::{V4l2CameraPublisher, V4l2Config, V4l2PublishError, v4l2_config_from_env};
+use videosource::{v4l2_config_from_env, V4l2CameraPublisher, V4l2Config, V4l2PublishError};
 
 #[cfg(not(all(feature = "v4l2", target_os = "linux")))]
 fn v4l2_config_from_env() -> anyhow::Result<()> {
@@ -295,7 +292,7 @@ async fn run_rtc_livekit_join(client: Client) -> anyhow::Result<RtcLiveKitRuntim
     let room_for_driver = room.clone();
     let service_url_for_driver = service_url.clone();
     let driver_handle = tokio::spawn(async move {
-        run_livekit_driver_with_handler(
+        run_livekit_driver_joined_left(
             room_for_driver,
             &prepared_livekit.connector,
             &service_url_for_driver,
@@ -305,31 +302,24 @@ async fn run_rtc_livekit_join(client: Client) -> anyhow::Result<RtcLiveKitRuntim
                 v4l2_config,
                 e2ee_context_for_driver,
             ),
-            |state, update| async move {
-                handle_joined_left_connection_update(
-                    state,
-                    update,
-                    &|mut state, room_handle, events| async move {
-                        info!(room_name = %room_handle.name(), "LiveKit room connected");
-                        let livekit_events = events;
-                        handle_per_participant_joined(
-                            &state.room,
-                            &room_handle,
-                            livekit_events,
-                            state.e2ee_context.as_ref(),
-                            "PER_PARTICIPANT_KEY_GRACE_PERIOD_MS",
-                            300,
-                        )
-                        .await;
-                        set_video_stream_enabled(&mut state, Some(room_handle), true).await?;
-                        Ok(state)
-                    },
-                    &|mut state| async move {
-                        set_video_stream_enabled(&mut state, None, false).await?;
-                        Ok(state)
-                    },
+            |mut state, room_handle, events| async move {
+                info!(room_name = %room_handle.name(), "LiveKit room connected");
+                let livekit_events = events;
+                handle_per_participant_joined(
+                    &state.room,
+                    &room_handle,
+                    livekit_events,
+                    state.e2ee_context.as_ref(),
+                    "PER_PARTICIPANT_KEY_GRACE_PERIOD_MS",
+                    300,
                 )
-                .await
+                .await;
+                set_video_stream_enabled(&mut state, Some(room_handle), true).await?;
+                Ok(state)
+            },
+            |mut state| async move {
+                set_video_stream_enabled(&mut state, None, false).await?;
+                Ok(state)
             },
         )
         .await
